@@ -349,3 +349,262 @@ def explain_account_balance(
             if cala_rows:
                 result["cala"] = list(cala_rows.values())
     return result
+
+
+# ---------------------------------------------------------------- reconcile
+
+def _reconcile_ctes(manifest: Manifest, cutoff: dt.datetime | None) -> tuple[str, list[Any], dict[str, str]]:
+    """CTE prefix shared by the leaf and set controls.
+
+    warehouse_leaf: balances rebuilt from entries (fct_account_balances as
+                    built, or fct_entries summed up to `cutoff`)
+    cala_all:       cala's own balances for every account, sets included
+                    (stg_cala_balances as built, or cala_balance_history at
+                    the latest version written up to `cutoff`)
+    accounts:       current account rows, to tell leaves from sets
+    """
+    balances = manifest.model("fct_account_balances").require(
+        "journal_id", "account_id", "currency", "layer", "dr_balance", "cr_balance"
+    )
+    entries = manifest.model("fct_entries").require(
+        "journal_id", "account_id", "currency", "layer", "debit_units", "credit_units", "recorded_at"
+    )
+    cala = manifest.model("stg_cala_balances").require(
+        "journal_id", "account_id", "currency", "layer", "dr_balance", "cr_balance"
+    )
+    history = manifest.source("cala_balance_history").require(
+        "journal_id", "account_id", "currency", "version", "values", "recorded_at"
+    )
+    accounts = manifest.model("dim_accounts").require("account_id", "is_account_set", "is_current")
+    layers = cala.accepted_values("layer")
+    if not layers:
+        raise ValueError(f"{cala.name}.layer has no accepted_values test in the manifest; cannot unpivot history")
+
+    params: list[Any] = []
+    if cutoff is None:
+        warehouse_leaf = (
+            f"select {_select_list(balances, 'journal_id', 'account_id', 'currency', 'layer', 'dr_balance', 'cr_balance')} "
+            f"from {balances.relation_name}"
+        )
+        cala_all = (
+            f"select {_select_list(cala, 'journal_id', 'account_id', 'currency', 'layer', 'dr_balance', 'cr_balance')} "
+            f"from {cala.relation_name}"
+        )
+        sources = {"warehouse": balances.name, "cala": cala.name}
+    else:
+        warehouse_leaf = f"""
+            select
+                {entries.col('journal_id')},
+                {entries.col('account_id')},
+                {entries.col('currency')},
+                {entries.col('layer')},
+                sum({entries.col('debit_units')})  as dr_balance,
+                sum({entries.col('credit_units')}) as cr_balance
+            from {entries.relation_name}
+            where {entries.col('recorded_at')} <= ?
+            group by 1, 2, 3, 4"""
+        params.append(cutoff)
+        # Same unpivot stg_cala_balances applies to cala_current_balances,
+        # here on the history row that was current at the cutoff.
+        unpivot = " union all ".join(
+            f"""
+            select
+                {history.col('journal_id')},
+                {history.col('account_id')},
+                {history.col('currency')},
+                '{layer}' as layer,
+                cast(json_extract_string({history.col('values')}, '$.{layer}.dr_balance') as decimal(38, 18)) as dr_balance,
+                cast(json_extract_string({history.col('values')}, '$.{layer}.cr_balance') as decimal(38, 18)) as cr_balance
+            from history_at"""
+            for layer in layers
+        )
+        cala_all = f"""
+            with history_at as (
+                select *
+                from {history.relation_name}
+                where {history.col('recorded_at')} <= ?
+                qualify row_number() over (
+                    partition by {history.col('journal_id')}, {history.col('account_id')}, {history.col('currency')}
+                    order by {history.col('version')} desc
+                ) = 1
+            )
+            {unpivot}"""
+        params.append(cutoff)
+        sources = {
+            "warehouse": f"{entries.name} where recorded_at <= as_of",
+            "cala": f"{history.name} at the latest version with recorded_at <= as_of",
+        }
+
+    ctes = f"""
+    with warehouse_leaf as ({warehouse_leaf}),
+    cala_all as ({cala_all}),
+    accounts as (
+        select {accounts.col('account_id')}, {accounts.col('is_account_set')}
+        from {accounts.relation_name}
+        where {accounts.col('is_current')}
+    )"""
+    return ctes, params, sources
+
+
+_STATUS_CASE = """
+        case
+            when c.account_id is null then 'missing_in_cala'
+            when w.account_id is null and (c.dr_balance <> 0 or c.cr_balance <> 0)
+                                      then 'missing_in_warehouse'
+            when w.account_id is null then 'ok_untouched_layer'
+            when c.dr_balance <> w.dr_balance
+              or c.cr_balance <> w.cr_balance
+                                      then 'amount_mismatch'
+            else 'ok'
+        end                                                     as status"""
+
+
+def _compared(cala_side: str, warehouse_side: str, key_label: str) -> str:
+    return f"""
+    compared as (
+        select
+            coalesce(c.journal_id, w.journal_id)                as journal_id,
+            coalesce(c.account_id, w.account_id)                as {key_label},
+            coalesce(c.currency, w.currency)                    as currency,
+            coalesce(c.layer, w.layer)                          as layer,
+            c.dr_balance                                        as cala_dr_balance,
+            c.cr_balance                                        as cala_cr_balance,
+            w.dr_balance                                        as warehouse_dr_balance,
+            w.cr_balance                                        as warehouse_cr_balance,
+            {_STATUS_CASE}
+        from ({cala_side}) as c
+        full outer join ({warehouse_side}) as w
+            on  w.journal_id = c.journal_id
+            and w.account_id = c.account_id
+            and w.currency   = c.currency
+            and w.layer      = c.layer
+    )"""
+
+
+def _run_control(wh: Warehouse, ctes: str, params: list[Any], compared: str, limit: int) -> dict[str, Any]:
+    counts = wh.query(
+        f"{ctes}, {compared} select status, count(*) as rows from compared group by 1 order by 1", params
+    )
+    mismatches = wh.query(
+        f"{ctes}, {compared} select * from compared where status not in ('ok', 'ok_untouched_layer') "
+        f"order by journal_id, 2, currency, layer limit ?",
+        [*params, limit],
+    )
+    by_status = {c["status"]: c["rows"] for c in counts}
+    mismatch_total = sum(n for s, n in by_status.items() if s not in ("ok", "ok_untouched_layer"))
+    return {
+        "rows_compared": sum(by_status.values()),
+        "rows_by_status": by_status,
+        "mismatch_count": mismatch_total,
+        "mismatches_truncated": mismatch_total > len(mismatches),
+        "mismatches": mismatches,
+    }
+
+
+def reconcile(
+    as_of: str | None = None,
+    limit: int = 500,
+    *,
+    manifest_path: Path | str = DEFAULT_MANIFEST,
+    duckdb_path: Path | str = DEFAULT_DUCKDB,
+) -> dict[str, Any]:
+    """Run the two balance reconciliation controls and return every mismatch.
+
+    Leaf control: balances rebuilt from entries must equal cala's own
+    persisted balances on the full (journal, account, currency, layer) grain,
+    exact decimals, zero tolerance. Set control: cala's balance for an
+    account set must equal our rollup of leaf balances through the
+    membership closure, scoped to the set's journal. An empty `mismatches`
+    list means green.
+
+    With as_of, both sides are taken at that instant: entries by recorded_at
+    and cala's side from cala_balance_history. The membership closure is
+    always current.
+    """
+    manifest = _manifest(manifest_path)
+    cutoff = parse_as_of(as_of)
+    ctes, params, sources = _reconcile_ctes(manifest, cutoff)
+    members = manifest.model("dim_account_set_members").require("account_set_id", "member_id", "member_kind")
+    sets = manifest.model("dim_account_sets").require("account_set_id", "journal_id")
+    members.check_value("member_kind", "account")
+
+    leaf = _compared(
+        cala_side="select c.* from cala_all as c join accounts as a on a.account_id = c.account_id where not a.is_account_set",
+        warehouse_side="select * from warehouse_leaf",
+        key_label="account_id",
+    )
+    rolled_up = f"""
+        select
+            b.journal_id,
+            cl.account_set_id                                   as account_id,
+            b.currency,
+            b.layer,
+            sum(b.dr_balance)                                   as dr_balance,
+            sum(b.cr_balance)                                   as cr_balance
+        from warehouse_leaf as b
+        inner join (
+            select distinct
+                m.{members.col('account_set_id')},
+                s.{sets.col('journal_id')},
+                m.{members.col('member_id')}                     as account_id
+            from {members.relation_name} as m
+            inner join {sets.relation_name} as s
+                on s.{sets.col('account_set_id')} = m.{members.col('account_set_id')}
+            where m.{members.col('member_kind')} = 'account'
+        ) as cl
+            on  cl.account_id = b.account_id
+            and cl.journal_id = b.journal_id
+        group by 1, 2, 3, 4"""
+    set_ = _compared(
+        cala_side="select c.* from cala_all as c join accounts as a on a.account_id = c.account_id where a.is_account_set",
+        warehouse_side=rolled_up,
+        key_label="account_set_id",
+    )
+
+    with open_warehouse(duckdb_path) as wh:
+        leaf_result = _run_control(wh, ctes, params, leaf, limit)
+        set_result = _run_control(wh, ctes, params, set_, limit)
+
+    controls = [
+        {
+            "name": "assert_balances_reconcile",
+            "grain": ["journal_id", "account_id", "currency", "layer"],
+            "compares": f"{sources['warehouse']} vs {sources['cala']}, leaf accounts only",
+            **leaf_result,
+        },
+        {
+            "name": "assert_account_set_balances_reconcile",
+            "grain": ["journal_id", "account_set_id", "currency", "layer"],
+            "compares": (
+                f"{sources['warehouse']} rolled up through {members.name} (scoped to the set's journal) "
+                f"vs {sources['cala']}, account sets only"
+            ),
+            **set_result,
+        },
+    ]
+    mismatches = [
+        {"control": c["name"], **m} for c in controls for m in c["mismatches"]
+    ]
+    for c in controls:
+        del c["mismatches"]
+    caveats = [
+        "statuses: amount_mismatch (both sides have the grain, amounts differ), missing_in_cala "
+        "(we have entries cala has no balance for), missing_in_warehouse (cala has a non-zero balance "
+        "we have no entries for). A 0/0 layer on cala's side with no entries on ours is a match.",
+    ]
+    if cutoff is not None:
+        caveats += [
+            "as_of: the membership closure (dim_account_set_members) is as of now, not as of the cutoff.",
+            "as_of: cala_balance_history.recorded_at is when cala wrote the balance (wall clock); "
+            "fct_entries.recorded_at is the entry event's timestamp. Entries recorded with a backdated "
+            "timestamp fall before the balance that includes them.",
+        ]
+    return {
+        "as_of": cutoff.isoformat() if cutoff else None,
+        "sources": sources,
+        "controls": controls,
+        "mismatches": mismatches,
+        "mismatches_truncated": any(c["mismatches_truncated"] for c in controls),
+        "is_reconciled": not mismatches and not any(c["mismatches_truncated"] for c in controls),
+        "caveats": caveats,
+    }
