@@ -8,7 +8,8 @@ A portable dbt package that models event-sourced ledger data produced by
 [`es-entity`](https://github.com/GaloyMoney/es-entity) /
 [`cala-ledger`](https://github.com/GaloyMoney/cala), plus a DuckDB harness so the
 whole package builds and tests locally from committed seeds with no cloud
-credentials.
+credentials, plus an MCP server (`mcp/`) that exposes ledger semantics over
+the built marts to an agent.
 
 The deliverable is the **tests**, not the models: a reconciliation suite that
 independently recomputes balances from raw entries and compares them to the
@@ -36,6 +37,14 @@ balances cala itself persisted.
 - Bounded load: `--vars '{"entries_as_of": "2026-01-01T00:00:00"}'` stops `stg_cala_entries` at a watermark
 - Benchmark: `uv run python scripts/benchmark_incremental.py` (needs a seeded database)
 
+### MCP server (mcp/)
+- `make mcp` — start the read-only MCP server on stdio (`uv run cala-mcp`). Needs `make build` first.
+- `make mcp-test` — `uv run pytest`; the suite reads `dbt/target/manifest.json` and
+  `dbt/cala_warehouse.duckdb` and skips if they are missing.
+- Single test: `uv run pytest mcp/tests/test_reconcile.py -k green`
+- Call a tool without MCP: `uv run python -c "from cala_mcp.tools import reconcile; print(reconcile()['mismatches'])"`
+- `CALA_WAREHOUSE_MANIFEST`, `CALA_WAREHOUSE_DUCKDB` — override the artefact paths
+
 ### Fixtures
 - `make fixtures` — regenerate `fixtures/seed/` by running cala's own integration
   test suite in Docker and dumping the resulting tables. Needs Docker and a
@@ -55,6 +64,14 @@ dbt/models/staging/        one model per entity event stream; unpacks event JSON
 dbt/models/marts/          dims, facts, and the trial balance report
         │
 dbt/tests/                 singular tests = the accounting controls
+        │
+mcp/cala_mcp/              MCP server over dbt/target/manifest.json + the DuckDB file
+  manifest.py              Manifest / Relation: models, columns, grain, lineage; require() gate
+  db.py                    read-only DuckDB connection; Decimal -> exact string
+  tools.py                 describe_model, list_models, trial_balance,
+                           explain_account_balance, reconcile as plain functions
+  server.py                MCPServer registration, ToolError mapping, stdio entrypoint
+mcp/tests/                 pytest over the built warehouse (no fixtures of its own)
 ```
 
 ### The controls (dbt/tests/)
@@ -77,6 +94,25 @@ dbt/tests/                 singular tests = the accounting controls
 - `layer` and `direction` arrive PascalCase in event JSON (`Settled`) but
   lowercase in Postgres enums; staging lowercases them.
 - `context` is null in the fixtures (cala's tests set none). Keep the column anyway.
+
+### MCP server rules (mcp/)
+- Every identifier in a query comes from the manifest: `manifest.model(name)`
+  for the relation, `rel.col(name)` / `rel.require(...)` for columns,
+  `rel.grain` for the grain, `rel.accepted_values(col)` for enums. No
+  hardcoded column lists; if a tool needs a column, describe it in the model's
+  yml so the manifest carries it (`test_every_mart_documents_every_physical_column`
+  enforces this for marts).
+- No SQL tool, no write path. `open_warehouse()` is `read_only=True`; keep it so.
+- Amounts are `Decimal` in DuckDB and exact strings in responses (`db.decimal_str`).
+  Never `float()` a balance.
+- Tool functions live in `tools.py` and take `manifest_path` / `duckdb_path`
+  keyword arguments so tests can point them anywhere; `server.py` only wires
+  them up. Raise `ManifestError` / `ValueError` for caller-fixable problems;
+  `server.anticipated` turns those into `ToolError` so the agent sees the text.
+- `mcp/` has no `__init__.py` on purpose: the importable package is
+  `cala_mcp`, so the PyPI `mcp` package is never shadowed.
+- The MCP SDK is 2.x: `MCPServer`, snake_case result fields (`is_error`,
+  `structured_content`, `input_schema`).
 
 ### Source data contract (from es-entity)
 Every entity has two tables:
@@ -131,4 +167,4 @@ explicitly says it is producing an "available" balance.
 
 ### Commits
 - Conventional commits: `feat(scope):`, `fix(scope):`, `test:`, `docs:`, `chore:`.
-- Scope is the layer: `fixtures`, `staging`, `marts`, `tests`, `ci`.
+- Scope is the layer: `fixtures`, `staging`, `marts`, `tests`, `ci`, `mcp`.
