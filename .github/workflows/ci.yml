@@ -1,0 +1,34 @@
+name: dbt build (DuckDB)
+
+# The whole package builds and tests from committed seeds. No credentials, no
+# services, no network beyond installing Python packages.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: dbt build (seed + run + test)
+        run: make build
+
+      - name: Incremental re-run is a no-op on unchanged seeds
+        run: cd dbt && uv run dbt run --select stg_cala_entries
+
+      - name: Upload dbt artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-target
+          path: dbt/target/run_results.json
