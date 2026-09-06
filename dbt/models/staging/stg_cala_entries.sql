@@ -14,16 +14,38 @@
 -- is idempotent and a watermark is safe. The watermark is PER ENTITY ID:
 -- every new entity starts at sequence 1, so a global max(sequence) would
 -- skip every entity created after the first load.
-with source as (
+--
+-- var entries_as_of (optional timestamp): only load events recorded at or
+-- before it. Lets a backfill stop at a watermark, and lets the benchmark in
+-- the README load the seeds in two batches.
+with
 
-    select * from {{ source('cala', 'cala_entry_events') }}
+{% if is_incremental() %}
+watermark as (
 
+    select
+        entry_id,
+        max(sequence)                                           as max_sequence
+    from {{ this }}
+    group by 1
+
+),
+{% endif %}
+
+source as (
+
+    select s.*
+    from {{ source('cala', 'cala_entry_events') }} as s
     {% if is_incremental() %}
-    where sequence > coalesce(
-        (select max(t.sequence) from {{ this }} as t
-         where t.entry_id = {{ source('cala', 'cala_entry_events') }}.id),
-        0
-    )
+    left join watermark as w
+        on w.entry_id = s.id
+    {% endif %}
+    where 1 = 1
+    {% if is_incremental() %}
+      and s.sequence > coalesce(w.max_sequence, 0)
+    {% endif %}
+    {% if var('entries_as_of', none) %}
+      and s.recorded_at <= cast('{{ var("entries_as_of") }}' as timestamp)
     {% endif %}
 
 ),
