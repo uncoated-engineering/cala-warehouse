@@ -20,7 +20,9 @@ jobs:
       - name: Install
         run: uv sync --frozen
 
-      - name: dbt build (seed + run + test)
+      # `make build` loads seeds first, then builds models + tests. Staging
+      # reads seeds through source(), which dbt does not order after seeds.
+      - name: dbt seed, then build (run + test)
         run: make build
 
       - name: Incremental re-run is a no-op on unchanged seeds

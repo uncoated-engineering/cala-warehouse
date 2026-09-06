@@ -36,8 +36,12 @@ run:
 test:
 	cd $(DBT_DIR) && $(DBT) test --target $(TARGET)
 
+# Seeds stand in for the extractor's tables, and staging reads them through
+# source(), which dbt does not link to seeds in the DAG. So load seeds first,
+# then build everything else; a single `dbt build` can race on a fresh database.
 build:
-	cd $(DBT_DIR) && $(DBT) build $(DBT_FLAGS)
+	cd $(DBT_DIR) && $(DBT) seed $(DBT_FLAGS)
+	cd $(DBT_DIR) && $(DBT) build $(DBT_FLAGS) --exclude resource_type:seed
 
 docs:
 	cd $(DBT_DIR) && $(DBT) docs generate --target $(TARGET)

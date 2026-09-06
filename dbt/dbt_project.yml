@@ -34,6 +34,10 @@ seeds:
   cala_warehouse:
     +schema: raw
     +quote_columns: false
+    # Fixtures exist for the local/CI harness only. On a real warehouse the
+    # source tables are landed by the extractor, and loading test fixtures
+    # over them would be a mistake, so seeds are disabled off DuckDB.
+    +enabled: "{{ target.name == 'duckdb' }}"
     # UUIDs are kept as strings for portability (BigQuery has no UUID type).
     # JSONB columns land as strings and are parsed in staging via macros.
     # The `*_events` tables all share the es-entity shape, hence the anchor.
