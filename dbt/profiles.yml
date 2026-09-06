@@ -1,0 +1,19 @@
+# Two targets, one package.
+#   duckdb   default; file-local, zero credentials, what CI and `make build` use
+#   bigquery same models against BigQuery (lana-bank's warehouse). Needs
+#            application-default credentials and the two env vars below.
+cala_warehouse:
+  target: duckdb
+  outputs:
+    duckdb:
+      type: duckdb
+      path: cala_warehouse.duckdb
+      threads: 4
+    bigquery:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('DBT_BIGQUERY_PROJECT') }}"
+      dataset: "{{ env_var('DBT_BIGQUERY_DATASET', 'cala_warehouse') }}"
+      location: "{{ env_var('DBT_BIGQUERY_LOCATION', 'US') }}"
+      threads: 4
+      priority: interactive

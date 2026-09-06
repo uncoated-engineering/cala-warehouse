@@ -1,0 +1,120 @@
+name: cala_warehouse
+version: 0.1.0
+config-version: 2
+profile: cala_warehouse
+require-dbt-version: ">=1.9.0"
+
+model-paths: [models]
+seed-paths: [../fixtures/seed]
+test-paths: [tests]
+macro-paths: [macros]
+target-path: target
+clean-targets: [target, dbt_packages]
+
+models:
+  cala_warehouse:
+    staging:
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: table
+      +schema: marts
+
+# Seeds are cala's own tables, dumped by fixtures/generate.sh. In production
+# these are the tables an extractor lands in the warehouse; sources.yml points
+# at the same names so the staging models never reference a seed directly.
+#
+# UUIDs are kept as strings for portability (BigQuery has no UUID type).
+# JSONB columns land as strings and are parsed in staging via macros.
+
+# Seeds are cala's own tables, dumped by fixtures/generate.sh. In production
+# these are the tables an extractor lands in the warehouse; sources.yml points
+# at the same names so the staging models never reference a seed directly.
+seeds:
+  cala_warehouse:
+    +schema: raw
+    +quote_columns: false
+    # UUIDs are kept as strings for portability (BigQuery has no UUID type).
+    # JSONB columns land as strings and are parsed in staging via macros.
+    # The `*_events` tables all share the es-entity shape, hence the anchor.
+    cala_journal_events:
+      +column_types: &event_stream
+        id: varchar
+        sequence: integer
+        event_type: varchar
+        event: varchar
+        context: varchar
+        recorded_at: timestamp
+    cala_account_events:
+      +column_types: *event_stream
+    cala_account_set_events:
+      +column_types: *event_stream
+    cala_tx_template_events:
+      +column_types: *event_stream
+    cala_transaction_events:
+      +column_types: *event_stream
+    cala_entry_events:
+      +column_types: *event_stream
+    cala_journals:
+      +column_types: {id: varchar, name: varchar, code: varchar, created_at: timestamp}
+    cala_accounts:
+      +column_types:
+        id: varchar
+        code: varchar
+        name: varchar
+        external_id: varchar
+        normal_balance_type: varchar
+        eventually_consistent: boolean
+        is_account_set: boolean
+        velocity_context_values: varchar
+        status: varchar
+        created_at: timestamp
+    cala_account_sets:
+      +column_types: {id: varchar, journal_id: varchar, name: varchar, external_id: varchar, created_at: timestamp}
+    cala_account_set_member_accounts:
+      +column_types: {account_set_id: varchar, member_account_id: varchar, created_at: timestamp}
+    cala_account_set_member_account_sets:
+      +column_types: {account_set_id: varchar, member_account_set_id: varchar, created_at: timestamp}
+    cala_tx_templates:
+      +column_types: {id: varchar, code: varchar, created_at: timestamp}
+    cala_transactions:
+      +column_types:
+        id: varchar
+        journal_id: varchar
+        tx_template_id: varchar
+        external_id: varchar
+        correlation_id: varchar
+        effective: date
+        created_at: timestamp
+    cala_entries:
+      +column_types:
+        id: varchar
+        journal_id: varchar
+        account_id: varchar
+        transaction_id: varchar
+        account_is_account_set: boolean
+        created_at: timestamp
+    cala_current_balances:
+      +column_types:
+        journal_id: varchar
+        account_id: varchar
+        currency: varchar
+        latest_version: integer
+        latest_values: varchar
+        created_at: timestamp
+    cala_balance_history:
+      +column_types:
+        journal_id: varchar
+        account_id: varchar
+        latest_entry_id: varchar
+        currency: varchar
+        version: integer
+        values: varchar
+        recorded_at: timestamp
+    cala_persistent_outbox_events:
+      +column_types:
+        id: varchar
+        sequence: bigint
+        payload: varchar
+        tracing_context: varchar
+        recorded_at: timestamp

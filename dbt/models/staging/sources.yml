@@ -1,0 +1,42 @@
+version: 2
+
+sources:
+  - name: cala
+    description: >
+      cala-ledger's Postgres tables as landed in the warehouse. Locally these
+      are the dbt seeds in fixtures/seed/ (dumped from cala's own integration
+      suite); in production they are whatever the extractor lands, with the
+      same names. Per es-entity's convention every entity has a mutable
+      current-state table and an append-only `*_events` stream with
+      UNIQUE(id, sequence).
+    schema: raw
+    tables:
+      # --- append-only event streams (safe to load incrementally on (id, sequence))
+      - name: cala_journal_events
+      - name: cala_account_events
+      - name: cala_account_set_events
+      - name: cala_transaction_events
+      - name: cala_entry_events
+        description: One `initialized` event per double-entry line. The only stream we model incrementally in v0.
+      - name: cala_tx_template_events
+      - name: cala_persistent_outbox_events
+        description: >
+          cala's outbox (`OutboxEventPayload`, serde-tagged on `type`). The only
+          place account-set membership changes are recorded as events; the
+          `*_events` streams do not carry them.
+
+      # --- mutable current-state tables (must be replaced, never sequence-watermarked)
+      - name: cala_journals
+      - name: cala_accounts
+      - name: cala_account_sets
+      - name: cala_account_set_member_accounts
+      - name: cala_account_set_member_account_sets
+      - name: cala_tx_templates
+      - name: cala_transactions
+      - name: cala_entries
+      - name: cala_current_balances
+        description: >
+          cala's own balance projection, one row per (journal, account,
+          currency) with the three layers nested in `latest_values`. This is
+          what `assert_balances_reconcile` compares our recomputation against.
+      - name: cala_balance_history

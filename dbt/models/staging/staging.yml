@@ -1,0 +1,117 @@
+version: 2
+
+models:
+  - name: stg_cala_journals
+    description: One row per journal event. Typed columns unpacked from the event JSON.
+    columns:
+      - name: journal_id
+        tests: [not_null]
+      - name: sequence
+        tests: [not_null]
+      - name: event_type
+        tests:
+          - accepted_values: {arguments: {values: [initialized, updated]}}
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [journal_id, sequence]
+
+  - name: stg_cala_accounts
+    description: >
+      One row per account event. `changed_fields` is cala's own list of which
+      attributes an `updated` event touched.
+    columns:
+      - name: account_id
+        tests: [not_null]
+      - name: event_type
+        tests:
+          - accepted_values: {arguments: {values: [initialized, updated]}}
+      - name: normal_balance_type
+        tests:
+          - accepted_values: {arguments: {values: [debit, credit]}}
+      - name: status
+        tests:
+          - accepted_values: {arguments: {values: [active, locked]}}
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [account_id, sequence]
+
+  - name: stg_cala_account_sets
+    columns:
+      - name: account_set_id
+        tests: [not_null]
+      - name: journal_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_cala_journals')
+                field: journal_id
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [account_set_id, sequence]
+
+  - name: stg_cala_account_set_members
+    description: Membership add/remove events replayed from cala's outbox.
+    columns:
+      - name: outbox_sequence
+        tests: [unique, not_null]
+      - name: member_kind
+        tests:
+          - accepted_values: {arguments: {values: [account, account_set]}}
+      - name: membership_change
+        tests:
+          - accepted_values: {arguments: {values: [added, removed]}}
+
+  - name: stg_cala_transactions
+    columns:
+      - name: transaction_id
+        tests: [not_null]
+      - name: journal_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('stg_cala_journals')
+                field: journal_id
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [transaction_id, sequence]
+
+  - name: stg_cala_entries
+    description: >
+      One row per entry event, loaded incrementally on (entry_id, sequence).
+      `units` is DECIMAL(38,18); the `layer` and `direction` are lower-cased
+      to match cala's Postgres enums.
+    columns:
+      - name: entry_id
+        tests: [not_null]
+      - name: units
+        tests:
+          - not_null
+          - dbt_utils_free_non_negative
+      - name: layer
+        tests:
+          - accepted_values: {arguments: {values: [settled, pending, encumbrance]}}
+      - name: direction
+        tests:
+          - accepted_values: {arguments: {values: [debit, credit]}}
+      - name: currency
+        tests: [not_null]
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [entry_id, sequence]
+
+  - name: stg_cala_balances
+    description: cala's own balance projection, unpivoted to the (journal, account, currency, layer) grain.
+    columns:
+      - name: layer
+        tests:
+          - accepted_values: {arguments: {values: [settled, pending, encumbrance]}}
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [journal_id, account_id, currency, layer]
