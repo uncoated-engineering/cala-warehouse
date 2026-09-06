@@ -1,85 +1,260 @@
 version: 2
 
+# Every column is described here, not only the tested ones. The MCP server
+# (mcp/) reads model names, columns, descriptions and `config.meta.grain` from
+# dbt's manifest.json and refuses to query a column the manifest does not
+# declare, so an undocumented column is invisible to an agent.
+
 models:
   - name: fct_entries
-    description: One row per double-entry line. The grain everything sits on.
+    description: >
+      One row per double-entry line. The grain everything sits on. Exactly one
+      of debit_units / credit_units is non-zero per row, so balances and trial
+      balances downstream are plain sums.
+    config:
+      meta:
+        grain: [entry_id]
     columns:
       - name: entry_id
+        description: cala entry id (UUID as string). One per double-entry line.
         tests: [unique, not_null]
       - name: transaction_id
+        description: The transaction this line belongs to.
         tests:
           - not_null
           - relationships:
               arguments:
                 to: ref('fct_transactions')
                 field: transaction_id
+      - name: journal_id
+        description: Journal the line was posted in. Balances never cross journals.
+        tests: [not_null]
       - name: account_id
+        description: Account the line posts to. Never an account set; cala forbids that.
         tests:
           - not_null
           - relationships:
               arguments:
                 to: ref('dim_accounts')
                 field: account_id
-      - name: journal_id
-        tests: [not_null]
+      - name: currency
+        description: ISO-style currency code as cala records it (USD, BTC, ...).
+      - name: layer
+        description: "One of settled | pending | encumbrance. Layers are separate ledgers sharing an account."
+      - name: direction
+        description: "debit | credit."
       - name: units
+        description: Unsigned amount, DECIMAL(38,18). Never a float.
         tests: [not_null]
+      - name: debit_units
+        description: units when direction = debit, else 0.
+      - name: credit_units
+        description: units when direction = credit, else 0.
+      - name: entry_type
+        description: cala's entry type code from the tx template.
+      - name: entry_sequence
+        description: Position of the line within its transaction, from cala.
+      - name: description
+        description: Free-text description from the entry event.
+      - name: metadata
+        description: Entry metadata as a JSON string.
+      - name: effective_date
+        description: Accounting effective date of the parent transaction.
+      - name: transaction_created_at
+        description: When cala created the parent transaction.
+      - name: recorded_at
+        description: When cala recorded the entry event. The as-of axis for trial_balance and reconcile.
+      - name: event_context
+        description: es-entity request / trace / actor context, JSON string. Null in the fixtures.
 
   - name: fct_transactions
     description: One row per transaction with entry aggregates and the per-currency balance check.
+    config:
+      meta:
+        grain: [transaction_id]
     columns:
       - name: transaction_id
+        description: cala transaction id.
         tests: [unique, not_null]
-      - name: is_balanced
-        tests:
-          - accepted_values: {arguments: {values: [true]}}
+      - name: journal_id
+        description: Journal the transaction posted in.
+      - name: tx_template_id
+        description: Template the transaction was built from.
+      - name: external_id
+        description: Caller-supplied external id, if any.
+      - name: correlation_id
+        description: Caller-supplied correlation id, if any.
+      - name: effective_date
+        description: Accounting effective date.
+      - name: description
+        description: Free-text description.
+      - name: metadata
+        description: Transaction metadata as a JSON string.
+      - name: version
+        description: cala's entity version after the latest event.
+      - name: event_count
+        description: Number of events on the transaction's stream.
       - name: entry_count
         description: Every transaction must have at least two entries.
         tests:
           - dbt_utils_free_at_least: {arguments: {value: 2}}
+      - name: currency_count
+        description: Distinct currencies across the transaction's entries.
+      - name: layer_count
+        description: Distinct layers across the transaction's entries.
+      - name: account_count
+        description: Distinct accounts across the transaction's entries.
+      - name: is_balanced
+        description: Debits equal credits in every currency of the transaction.
+        tests:
+          - accepted_values: {arguments: {values: [true]}}
+      - name: created_at
+        description: When cala created the transaction.
+      - name: modified_at
+        description: recorded_at of the latest event on the transaction.
+      - name: event_context
+        description: es-entity context of the latest event, JSON string.
 
   - name: fct_account_balances
     description: >
-      Balances recomputed from fct_entries at the full grain. Independent of
-      cala_current_balances; see assert_balances_reconcile.
+      Balances recomputed from fct_entries at the full grain
+      (journal_id, account_id, currency, layer). Independent of
+      cala_current_balances; see assert_balances_reconcile. Only accounts that
+      entries post to appear; set balances are rollups, not rows here.
+    config:
+      meta:
+        grain: [journal_id, account_id, currency, layer]
     columns:
-      - name: dr_balance
-        tests: [not_null]
-      - name: cr_balance
-        tests: [not_null]
+      - name: journal_id
+        description: Journal. Part of the grain; the same account can hold balances in several journals.
+      - name: account_id
+        description: Account. Never an account set.
+      - name: currency
+        description: Currency code.
       - name: layer
+        description: "settled | pending | encumbrance. Never sum across layers unless producing an explicit 'available' figure."
         tests:
           - accepted_values: {arguments: {values: [settled, pending, encumbrance]}}
+      - name: dr_balance
+        description: Sum of debit_units over the grain. DECIMAL(38,18).
+        tests: [not_null]
+      - name: cr_balance
+        description: Sum of credit_units over the grain. DECIMAL(38,18).
+        tests: [not_null]
+      - name: balance
+        description: >
+          Signed by the account's normal balance side: dr - cr for debit-normal
+          accounts, cr - dr for credit-normal. Positive means the account holds
+          a balance on its natural side.
+      - name: normal_balance_type
+        description: "debit | credit, from the account's latest event."
+      - name: entry_count
+        description: Number of entries summed into this row.
+      - name: latest_entry_id
+        description: The entry that last touched this grain (by recorded_at, entry_sequence, entry_id).
+      - name: first_entry_at
+        description: recorded_at of the earliest entry on the grain.
+      - name: last_entry_at
+        description: recorded_at of the latest entry on the grain.
     tests:
       - dbt_utils_free_unique_combination:
           arguments:
             combination: [journal_id, account_id, currency, layer]
 
   - name: rpt_trial_balance
-    description: Per journal, currency and layer, total debits, total credits and their difference.
+    description: >
+      Per (journal_id, currency, layer): total debits, total credits and their
+      difference, computed from fct_account_balances, i.e. from the entries.
+      In a correct double-entry ledger difference is zero on every row.
+    config:
+      meta:
+        grain: [journal_id, currency, layer]
     columns:
+      - name: journal_id
+        description: Journal.
+      - name: journal_name
+        description: Journal name from its latest event.
+      - name: journal_code
+        description: Journal code from its latest event, if set.
+      - name: currency
+        description: Currency code.
+      - name: layer
+        description: "settled | pending | encumbrance."
+      - name: account_count
+        description: Distinct accounts with a balance on the row.
+      - name: entry_count
+        description: Entries summed into the row.
+      - name: total_debits
+        description: Sum of dr_balance over the row's accounts. DECIMAL(38,18).
+      - name: total_credits
+        description: Sum of cr_balance over the row's accounts. DECIMAL(38,18).
       - name: difference
-        description: Must be zero on every row of a correct ledger.
+        description: total_debits - total_credits. Must be zero on every row of a correct ledger.
         tests:
           - accepted_values:
               arguments:
                 values: [0]
                 quote: false
+      - name: is_balanced
+        description: difference = 0.
+      - name: as_of
+        description: recorded_at of the latest entry summed into the row.
     tests:
       - dbt_utils_free_unique_combination:
           arguments:
             combination: [journal_id, currency, layer]
 
   - name: dim_accounts
-    description: SCD-2 account history, one row per account version.
+    description: >
+      SCD-2 account history, one row per account version. The event stream is
+      the change history: every event opens a version and closes the previous
+      one. valid_from / valid_to are half-open.
+    config:
+      meta:
+        grain: [account_id, version_number]
     columns:
       - name: account_version_key
+        description: "account_id || ':' || version_number."
         tests: [unique, not_null]
       - name: account_id
+        description: cala account id. Account sets have a backing account with the same id.
         tests: [not_null]
+      - name: version_number
+        description: Event sequence that opened this version (1..n).
+      - name: cala_version
+        description: cala's own version counter on the event.
+      - name: code
+        description: Account code.
+      - name: name
+        description: Account name.
+      - name: external_id
+        description: Caller-supplied external id, if any.
+      - name: description
+        description: Free-text description.
       - name: normal_balance_type
+        description: "debit | credit. Determines the sign of fct_account_balances.balance."
         tests:
           - accepted_values: {arguments: {values: [debit, credit]}}
+      - name: status
+        description: "active | locked."
+      - name: is_account_set
+        description: True when this account is the backing account of an account set.
+      - name: eventually_consistent
+        description: cala's eventually-consistent flag for the account.
+      - name: metadata
+        description: Account metadata as a JSON string.
+      - name: event_type
+        description: "initialized | updated: the event that opened this version."
+      - name: changed_fields
+        description: cala's own list of attributes the `updated` event touched.
+      - name: valid_from
+        description: recorded_at of the event that opened the version.
+      - name: valid_to
+        description: recorded_at of the next event, null for the current version.
+      - name: is_current
+        description: valid_to is null.
+      - name: event_context
+        description: es-entity context of the opening event, JSON string.
     tests:
       - dbt_utils_free_unique_combination:
           arguments:
@@ -89,8 +264,15 @@ models:
             key_column: account_id
 
   - name: dim_account_sets
+    description: >
+      One row per account set with its journal, position in the hierarchy and
+      member counts. A set belongs to exactly one journal.
+    config:
+      meta:
+        grain: [account_set_id]
     columns:
       - name: account_set_id
+        description: cala account set id; equals the id of its backing account.
         tests:
           - unique
           - not_null
@@ -98,13 +280,63 @@ models:
               arguments:
                 to: ref('dim_accounts')
                 field: account_id
+      - name: journal_id
+        description: The set's journal. cala only rolls postings in this journal into the set.
+      - name: name
+        description: Set name.
+      - name: external_id
+        description: Caller-supplied external id, if any.
+      - name: description
+        description: Free-text description.
+      - name: normal_balance_type
+        description: "debit | credit, from the backing account."
+      - name: metadata
+        description: Set metadata as a JSON string.
+      - name: cala_version
+        description: cala's version counter after the latest event.
+      - name: depth_from_root
+        description: Longest path from a root set down to this one; 0 for roots.
+      - name: is_root
+        description: The set has no parent set.
+      - name: direct_parent_count
+        description: Sets this set is a direct member of. Can exceed 1; the hierarchy is a DAG.
+      - name: direct_account_count
+        description: Accounts that are direct members.
+      - name: direct_set_count
+        description: Sets that are direct members.
+      - name: descendant_account_count
+        description: Distinct accounts anywhere underneath the set.
+      - name: subtree_depth
+        description: Longest path from this set down to a leaf account.
+      - name: last_event_at
+        description: recorded_at of the latest event on the set.
+      - name: event_context
+        description: es-entity context of the latest event, JSON string.
 
   - name: dim_account_set_members
-    description: Transitive closure of set membership; one row per (set, member, path).
+    description: >
+      Transitive closure of set membership as of now; one row per
+      (account_set_id, member_id, path). A member can reach the same ancestor
+      by several paths, so path is part of the grain; de-duplicate on
+      (account_set_id, member_id) before rolling balances up.
+    config:
+      meta:
+        grain: [account_set_id, member_id, path]
     columns:
+      - name: account_set_id
+        description: The ancestor set.
+      - name: member_id
+        description: An account or set somewhere underneath it.
+      - name: member_kind
+        description: "account | account_set."
       - name: depth
+        description: Number of edges from the set to the member; 1 for direct members.
         tests:
           - dbt_utils_free_at_least: {arguments: {value: 1}}
+      - name: path
+        description: "'>'-joined ids from the set down to the member."
+      - name: member_since
+        description: recorded_at of the latest membership add along the path.
     tests:
       - dbt_utils_free_unique_combination:
           arguments:

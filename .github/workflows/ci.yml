@@ -1,7 +1,8 @@
 name: dbt build (DuckDB)
 
 # The whole package builds and tests from committed seeds. No credentials, no
-# services, no network beyond installing Python packages.
+# services, no network beyond installing Python packages. The mcp-tests job
+# rebuilds the same warehouse and runs the MCP server's pytest suite over it.
 on:
   push:
     branches: [main]
@@ -34,3 +35,26 @@ jobs:
         with:
           name: dbt-target
           path: dbt/target/run_results.json
+
+  mcp-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      # The tools read manifest.json and the DuckDB file that `make build`
+      # writes; there is no other fixture.
+      - name: dbt seed, then build
+        run: make build
+
+      - name: pytest (MCP tools, in-process server)
+        run: make mcp-test
+
+      - name: The stdio server starts and exits on EOF
+        run: timeout 20 uv run cala-mcp < /dev/null

@@ -5,6 +5,8 @@
 #   make build   dbt build (models + tests)
 #   make test    dbt test only
 #   make build FULL_REFRESH=1   rebuild incremental models from scratch
+#   make mcp     start the read-only MCP server (stdio) over the built DuckDB file
+#   make mcp-test  pytest for the MCP tools; needs `make build` first
 #
 # `make fixtures` regenerates the seeds by running cala's own integration
 # suite in Docker and dumping the resulting tables. Requires Docker and a
@@ -22,7 +24,7 @@ CALA_DIR ?= ../cala
 FULL_REFRESH ?=
 DBT_FLAGS    := --target $(TARGET) $(if $(FULL_REFRESH),--full-refresh,)
 
-.PHONY: install seed build test run clean fixtures docs
+.PHONY: install seed build test run clean fixtures docs mcp mcp-test
 
 install:
 	uv sync
@@ -52,3 +54,12 @@ clean:
 
 fixtures:
 	CALA_DIR=$(CALA_DIR) ./fixtures/generate.sh
+
+# The MCP server reads dbt/target/manifest.json and dbt/cala_warehouse.duckdb
+# (read-only), both written by `make build`. Talks MCP over stdio; point an
+# MCP client at `uv run cala-mcp` with this directory as cwd.
+mcp:
+	uv run cala-mcp
+
+mcp-test:
+	uv run pytest

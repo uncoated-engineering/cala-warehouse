@@ -40,3 +40,23 @@ sources:
           currency) with the three layers nested in `latest_values`. This is
           what `assert_balances_reconcile` compares our recomputation against.
       - name: cala_balance_history
+        description: >
+          Every version of every (journal, account, currency) balance cala has
+          written, with the three layers nested in `values` exactly as in
+          cala_current_balances.latest_values. Not modelled; the MCP server
+          reads it directly to reconcile as of a past instant.
+        columns:
+          - name: journal_id
+            description: Journal.
+          - name: account_id
+            description: Account, including account-set backing accounts.
+          - name: currency
+            description: Currency code.
+          - name: version
+            description: Balance version; increases by one per posting that touches the (journal, account, currency).
+          - name: values
+            description: JSON string with settled / pending / encumbrance objects, each carrying dr_balance, cr_balance, entry_id, modified_at.
+          - name: latest_entry_id
+            description: The entry that produced this version.
+          - name: recorded_at
+            description: When cala wrote this version. Wall-clock time, not the entry's recorded_at.

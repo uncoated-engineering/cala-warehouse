@@ -13,6 +13,7 @@ from raw double-entry lines and proves it equals what cala itself persisted.
 ```sh
 make install   # uv sync
 make build     # dbt seed, then dbt build: 17 seeds, 14 models, 63 tests, ~10s
+make mcp       # read-only MCP server (stdio) over the marts; see "MCP server" below
 ```
 
 ## What it proves
@@ -56,10 +57,13 @@ dbt/
   profiles.yml         targets: duckdb (default), bigquery
   macros/cross_db.sql  json_string / json_decimal / ... dispatch per adapter
   models/staging/      one model per event stream + the outbox + cala's balances
-  models/marts/        dims, facts, trial balance
+  models/marts/        dims, facts, trial balance; every column described in marts.yml
   tests/               the five controls above
+mcp/
+  cala_mcp/            the MCP server: manifest reader, read-only DuckDB, tools
+  tests/               pytest over the built warehouse, incl. reconcile() == []
 scripts/benchmark_incremental.py
-.github/workflows/ci.yml   dbt seed + build on DuckDB, no secrets
+.github/workflows/ci.yml   build: dbt seed + build; mcp-tests: the same, then pytest
 ```
 
 ### Lineage
@@ -183,6 +187,49 @@ second batch correctly. Its cost scales with new events, not with history.
 This is only valid because `cala_entry_events` is append-only; the mutable
 current-state tables must still be replaced.
 
+## MCP server
+
+`make mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io)
+server over the DuckDB file dbt produces, so an agent can ask ledger
+questions in ledger terms instead of writing SQL against tables it has to
+guess the meaning of. Five read-only tools:
+
+| tool | answers |
+|---|---|
+| `describe_model(name)` | columns with descriptions and data types, grain, upstream / downstream models and tests, all from `dbt/target/manifest.json` |
+| `list_models()` | every model with its grain and one-line description |
+| `trial_balance(journal_id, as_of=None)` | `rpt_trial_balance` for one journal; with `as_of`, recomputed from `fct_entries` where `recorded_at <= as_of` |
+| `explain_account_balance(account_id, currency, layer, journal_id=None, limit=200)` | the `fct_account_balances` row(s) and the ordered entry chain with running debit, credit and signed totals, plus cala's own figure for the grain |
+| `reconcile(as_of=None, limit=500)` | the leaf and account-set reconciliation controls; `mismatches` is empty when green. With `as_of`, cala's side comes from `cala_balance_history` |
+
+Rules the server keeps:
+
+- **Grounded in the manifest.** Model names, relation names, columns, grain
+  (`config.meta.grain`) and even the allowed values of `layer` come from
+  `manifest.json`. A query cannot name a column the yml does not declare; if
+  the manifest is missing the tool says so and stops.
+- **Read-only by construction.** DuckDB is opened `read_only=True`, there is
+  no SQL tool, and the parameters above are the whole surface.
+- **Decimals stay decimals.** `DECIMAL(38,18)` values are returned as exact
+  strings, never floats.
+
+Point an MCP client at `uv run cala-mcp` with the repo as working directory
+(`CALA_WAREHOUSE_MANIFEST` / `CALA_WAREHOUSE_DUCKDB` override the paths).
+`make mcp-test` runs the suite; CI's `mcp-tests` job does the same after
+`make build`.
+
+### Finding: as-of reconciliation and backdated entries
+
+`reconcile(as_of=...)` compares entries by their `recorded_at` with the
+balance version cala had written by the same instant. Eight fixture grains
+carry entries recorded with a 2025 timestamp (cala's tests post with explicit
+dates) while cala wrote their balances on the day the fixtures were dumped.
+Any `as_of` between those two instants reports them as `missing_in_cala`,
+and the tool's caveats say so. That is not a bug in either side; it is the
+difference between an event's timestamp and the time its projection was
+written, and a production as-of comparison has to pick one axis and
+snapshot both sides on it.
+
 ## Portability
 
 `profiles.yml` has a `bigquery` target. Dialect differences live in
@@ -215,10 +262,14 @@ erasure propagation. An append-only warehouse does not honour es-entity's
 "forgettable" erasure requests; that is a real obligation once raw event JSON
 is landed, and a good next project.
 
-Ideas that follow from this one: an MCP server over the marts exposing ledger
-semantics (`trial_balance(journal, as_of)`, `explain_account_balance(account)`
-walking the entry chain, `reconcile(as_of)`) grounded in dbt's `manifest.json`
-so an agent knows column meanings and lineage instead of guessing joins.
+No auth on the MCP server either: it is a local stdio process over a local
+file, which is the right shape for v1 and the wrong one for anything shared.
+
+Ideas that follow from this one: an as-of membership closure so
+`reconcile(as_of)` can rebuild set rollups at a past instant; a
+`explain_transaction` tool walking a transaction's lines and the template
+that produced them; the same tools over BigQuery once the package has run
+there.
 
 ## Development
 
