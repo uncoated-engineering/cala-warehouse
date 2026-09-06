@@ -42,6 +42,7 @@ class Column:
     name: str
     description: str
     tests: tuple[str, ...] = ()
+    accepted_values: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -83,10 +84,26 @@ class Relation:
     def cols(self, *names: str) -> list[str]:
         return [self.col(n) for n in names]
 
+    def accepted_values(self, column: str) -> tuple[str, ...] | None:
+        """Values an accepted_values test allows on the column, or None if untested."""
+        return self.columns[self.col(column)].accepted_values
 
-def _column_tests(node_id: str, manifest: dict[str, Any]) -> dict[str, list[str]]:
-    """Generic tests attached to a node, keyed by column name."""
-    out: dict[str, list[str]] = {}
+    def check_value(self, column: str, value: str) -> str:
+        allowed = self.accepted_values(column)
+        if allowed is not None and value not in allowed:
+            raise UnknownColumn(
+                f"{self.name}.{column} accepts {list(allowed)} (per its accepted_values test), got {value!r}"
+            )
+        return value
+
+
+def _column_tests(
+    node_id: str, manifest: dict[str, Any]
+) -> tuple[dict[str, list[str]], dict[str, tuple[str, ...]]]:
+    """Generic tests attached to a node, keyed by column name, plus any
+    accepted_values lists so tools can validate inputs without hardcoding."""
+    tests: dict[str, list[str]] = {}
+    accepted: dict[str, tuple[str, ...]] = {}
     for child_id in manifest.get("child_map", {}).get(node_id, []):
         test = manifest["nodes"].get(child_id)
         if not test or test.get("resource_type") != "test":
@@ -94,9 +111,13 @@ def _column_tests(node_id: str, manifest: dict[str, Any]) -> dict[str, list[str]
         column = test.get("column_name")
         if not column:
             continue
-        kind = (test.get("test_metadata") or {}).get("name") or test["name"]
-        out.setdefault(column, []).append(kind)
-    return out
+        meta = test.get("test_metadata") or {}
+        kind = meta.get("name") or test["name"]
+        tests.setdefault(column, []).append(kind)
+        if kind == "accepted_values":
+            values = (meta.get("kwargs") or {}).get("values") or []
+            accepted[column] = tuple(str(v) for v in values)
+    return tests, accepted
 
 
 def _grain(node: dict[str, Any]) -> tuple[str, ...]:
@@ -139,12 +160,13 @@ class Manifest:
             return node["name"] if node else None
 
         def rel(uid: str, node: dict[str, Any]) -> Relation:
-            tests_by_col = _column_tests(uid, self.raw)
+            tests_by_col, accepted_by_col = _column_tests(uid, self.raw)
             columns = {
                 c["name"]: Column(
                     name=c["name"],
                     description=(c.get("description") or "").strip(),
                     tests=tuple(tests_by_col.get(c["name"], [])),
+                    accepted_values=accepted_by_col.get(c["name"]),
                 )
                 for c in (node.get("columns") or {}).values()
             }
