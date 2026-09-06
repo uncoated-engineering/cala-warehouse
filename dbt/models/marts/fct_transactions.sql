@@ -39,7 +39,7 @@ balanced as (
 
     select
         transaction_id,
-        bool_and(debit_units = credit_units)                    as is_balanced
+        {{ bool_and_agg('debit_units = credit_units') }}        as is_balanced
     from per_currency
     group by 1
 

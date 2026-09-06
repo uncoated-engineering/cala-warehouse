@@ -21,8 +21,8 @@ direct_children as (
 
     select
         account_set_id,
-        count(*) filter (where member_kind = 'account')         as direct_account_count,
-        count(*) filter (where member_kind = 'account_set')     as direct_set_count
+        {{ count_where("member_kind = 'account'") }}             as direct_account_count,
+        {{ count_where("member_kind = 'account_set'") }}         as direct_set_count
     from membership
     where depth = 1
     group by 1
@@ -33,7 +33,7 @@ descendants as (
 
     select
         account_set_id,
-        count(distinct member_id) filter (where member_kind = 'account')
+        count(distinct case when member_kind = 'account' then member_id end)
                                                                 as descendant_account_count,
         max(depth)                                              as max_depth
     from membership
@@ -48,7 +48,8 @@ parents as (
     select
         member_id                                               as account_set_id,
         max(depth)                                              as depth_from_root,
-        count(distinct account_set_id) filter (where depth = 1) as direct_parent_count
+        count(distinct case when depth = 1 then account_set_id end)
+                                                                as direct_parent_count
     from membership
     where member_kind = 'account_set'
     group by 1

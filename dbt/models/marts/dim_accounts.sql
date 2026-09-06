@@ -41,7 +41,8 @@ versioned as (
 final as (
 
     select
-        account_id || ':' || cast(sequence as varchar)          as account_version_key,
+        account_id || ':' || cast(sequence as {{ dbt.type_string() }})
+                                                                as account_version_key,
         account_id,
         sequence                                                as version_number,
         version                                                 as cala_version,

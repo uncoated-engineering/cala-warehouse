@@ -29,8 +29,8 @@ where {{ column_name }} < {{ value }}
 {% test dbt_utils_free_scd2_single_current(model, key_column) %}
 select
     {{ key_column }},
-    count(*) filter (where is_current) as current_rows
+    {{ count_where('is_current') }} as current_rows
 from {{ model }}
 group by {{ key_column }}
-having count(*) filter (where is_current) <> 1
+having {{ count_where('is_current') }} <> 1
 {% endtest %}

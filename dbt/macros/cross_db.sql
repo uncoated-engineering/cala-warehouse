@@ -78,3 +78,27 @@
 {% macro bigquery__array_has(array_expr, value) -%}
   {{ value }} in unnest({{ array_expr }})
 {%- endmacro %}
+
+
+{#- count(*) filter (where ...) is DuckDB/Postgres; BigQuery has countif. -#}
+{% macro count_where(condition) -%}
+  {{ return(adapter.dispatch('count_where', 'cala_warehouse')(condition)) }}
+{%- endmacro %}
+{% macro default__count_where(condition) -%}
+  count(*) filter (where {{ condition }})
+{%- endmacro %}
+{% macro bigquery__count_where(condition) -%}
+  countif({{ condition }})
+{%- endmacro %}
+
+
+{#- Aggregate AND over a boolean column. -#}
+{% macro bool_and_agg(expression) -%}
+  {{ return(adapter.dispatch('bool_and_agg', 'cala_warehouse')(expression)) }}
+{%- endmacro %}
+{% macro default__bool_and_agg(expression) -%}
+  bool_and({{ expression }})
+{%- endmacro %}
+{% macro bigquery__bool_and_agg(expression) -%}
+  logical_and({{ expression }})
+{%- endmacro %}
