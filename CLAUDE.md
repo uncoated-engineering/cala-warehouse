@@ -9,7 +9,8 @@ A portable dbt package that models event-sourced ledger data produced by
 [`cala-ledger`](https://github.com/GaloyMoney/cala), plus a DuckDB harness so the
 whole package builds and tests locally from committed seeds with no cloud
 credentials, plus an MCP server (`mcp/`) that exposes ledger semantics over
-the built marts to an agent.
+the built marts to an agent, plus an extractor (`extract/`) that lands the
+same tables from a live cala Postgres with the outbox as the change log.
 
 The deliverable is the **tests**, not the models: a reconciliation suite that
 independently recomputes balances from raw entries and compares them to the
@@ -45,19 +46,35 @@ balances cala itself persisted.
 - Call a tool without MCP: `uv run python -c "from cala_mcp.tools import reconcile; print(reconcile()['mismatches'])"`
 - `CALA_WAREHOUSE_MANIFEST`, `CALA_WAREHOUSE_DUCKDB` — override the artefact paths
 
+### Extractor (extract/)
+- `make fixture-pg` — Docker Postgres on 5434 loaded with `fixtures/schema.sql` + the seeds; `make fixture-pg-stop` removes it
+- `make extract` — `uv run cala-extract --verify` from `$CALA_PG_URL` (defaults to the fixture Postgres)
+  into `dbt/cala_warehouse.duckdb`, schema `raw`. `make clean` first if `make build` (seeds) ran on that file.
+- `make build-extracted` — `dbt build --exclude resource_type:seed` on what was landed
+- `make extract-test` — `uv run pytest extract/tests`; skips without `CALA_PG_URL`. DESTRUCTIVE on that
+  database: every test drops and recreates its `public` schema.
+- Single test: `uv run pytest extract/tests -k in_flight`
+- `uv run cala-extract --json`, `--full-refresh`, `--destination bigquery`, `--page-size N`
+- `uv run python -m cala_extract.fixture_db $URL` — load schema + seeds into any Postgres
+
 ### Fixtures
 - `make fixtures` — regenerate `fixtures/seed/` by running cala's own integration
   test suite in Docker and dumping the resulting tables. Needs Docker and a
   checkout of cala at `../cala` (override with `CALA_DIR=...`).
 - Never hand-edit seed CSVs. They must come from cala's code so the schemas
   and event sequences are real. `fixtures/MANIFEST.md` records which cala
-  produced them and what its test suite reported.
+  produced them and what its test suite reported. `fixtures/schema.sh`
+  (called by `generate.sh`) dumps `fixtures/schema.sql` from cala's migrations;
+  never hand-edit that either.
 - Seeds are disabled off the `duckdb` target so fixtures never land on a real warehouse.
 
 ## Architecture Overview
 
 ```
-fixtures/seed/*.csv        raw cala tables as dumped from Postgres (dbt seeds)
+cala Postgres ──cala-extract──┐   (production path; extract/cala_extract/)
+fixtures/seed/*.csv (dbt seeds)┤   (local / CI path)
+        │
+   raw.cala_*              the same 17 tables either way
         │
 dbt/models/staging/        one model per entity event stream; unpacks event JSON
         │                  into typed columns, keeps `context` for audit lineage
@@ -72,6 +89,16 @@ mcp/cala_mcp/              MCP server over dbt/target/manifest.json + the DuckDB
                            explain_account_balance, reconcile as plain functions
   server.py                MCPServer registration, ToolError mapping, stdio entrypoint
 mcp/tests/                 pytest over the built warehouse (no fixtures of its own)
+
+extract/cala_extract/      dlt source over cala's Postgres
+  tables.py                what is a stream (outbox-keyed, merge) vs state (replace);
+                           column discovery + casts from information_schema
+  source.py                Snapshot (REPEATABLE READ + xid marker), outbox resource with
+                           the contiguity watermark, keyed transformers, resolve_watermark
+  pipeline.py              build_pipeline (duckdb | bigquery), extract(), RunSummary, seed guard
+  cli.py                   `cala-extract`
+  fixture_db.py            load schema.sql + seeds into a Postgres (tests, CI, make fixture-pg)
+extract/tests/             pytest against that Postgres; needs CALA_PG_URL
 ```
 
 ### The controls (dbt/tests/)
@@ -94,6 +121,29 @@ mcp/tests/                 pytest over the built warehouse (no fixtures of its o
 - `layer` and `direction` arrive PascalCase in event JSON (`Settled`) but
   lowercase in Postgres enums; staging lowercases them.
 - `context` is null in the fixtures (cala's tests set none). Keep the column anyway.
+
+### Extractor rules (extract/)
+- The cursor is the outbox `sequence`, never `recorded_at` (caller-supplied
+  and backdatable; see README "Extraction"). The watermark advances only
+  across contiguous sequences; a hole is skipped only after the xmin-horizon
+  proof in `resolve_watermark`, which mirrors obix's `abandonment_proof_passed`.
+  The marker is a real xid from an auto-commit statement taken after the
+  snapshot; the snapshot's own xmax is not a valid marker.
+- Everything is read from one REPEATABLE READ snapshot so streams and state
+  agree. Do not add a resource that opens its own connection for data.
+- Streams (`*_events` + outbox) are `merge` on their unique key; state tables
+  are `replace`. A new `*_events` table becomes a `Stream` in `tables.py` only
+  with the outbox payload types that announce it; if the outbox does not
+  announce every write to it (templates), it is state.
+- Column lists come from information_schema with one cast per type family so
+  the landed shape equals the seeds: UUID / JSON / enum as text, timestamptz
+  as naive UTC `timestamp`. Every column gets a dlt type hint so all-NULL
+  columns (`context`) still exist downstream.
+- The extractor never writes to the source: the snapshot is READ ONLY and
+  the proof connection only reads.
+- Tests assert on `RunSummary` (watermarks, `rows_loaded`, `stalled_at`,
+  `abandoned`, `verification_failures`) and on row-for-row equality with the
+  seeds via `warehouse_checks.assert_raw_equals_seeds`.
 
 ### MCP server rules (mcp/)
 - Every identifier in a query comes from the manifest: `manifest.model(name)`
@@ -135,6 +185,9 @@ explicitly says it is producing an "available" balance.
 - `DBT_TARGET` — not used; pass `--target` or `make TARGET=...`
 - `DBT_PROFILES_DIR` — defaults to `dbt/` (a `profiles.yml` is committed there)
 - `CALA_DIR` — path to a cala checkout for `make fixtures` (default `../cala`)
+- `CALA_PG_URL` — the Postgres `cala-extract` and `extract/tests` read (Makefile default: the fixture Postgres on 5434)
+- `CALA_EXTRACT_PIPELINES_DIR` — dlt's local state (default `.dlt/pipelines`, gitignored)
+- `FIXTURE_PG_PORT` — port for `make fixture-pg` (default 5434)
 - `DBT_BIGQUERY_PROJECT`, `DBT_BIGQUERY_DATASET` — only for the `bigquery` target
 
 ## Code Style Guide
@@ -167,4 +220,4 @@ explicitly says it is producing an "available" balance.
 
 ### Commits
 - Conventional commits: `feat(scope):`, `fix(scope):`, `test:`, `docs:`, `chore:`.
-- Scope is the layer: `fixtures`, `staging`, `marts`, `tests`, `ci`, `mcp`.
+- Scope is the layer: `fixtures`, `staging`, `marts`, `tests`, `ci`, `mcp`, `extract`.

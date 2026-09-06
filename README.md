@@ -14,6 +14,7 @@ from raw double-entry lines and proves it equals what cala itself persisted.
 make install   # uv sync
 make build     # dbt seed, then dbt build: 17 seeds, 14 models, 63 tests, ~10s
 make mcp       # read-only MCP server (stdio) over the marts; see "MCP server" below
+make extract   # land the same 17 tables from a live cala Postgres; see "Extraction" below
 ```
 
 ## What it proves
@@ -51,6 +52,8 @@ Everything here applies to any service on the es-entity stack, not only cala.
 fixtures/
   generate.sh          run cala's test suite in Docker, dump 17 tables to CSV
   manifest.sh          write MANIFEST.md (cala version, test results, row counts)
+  schema.sh            dump the DDL of those tables from cala's migrations
+  schema.sql           the committed DDL; the extractor tests recreate cala from it
   seed/*.csv           the committed seeds (12 MB)
 dbt/
   dbt_project.yml      seeds typed per table; UUIDs as strings, JSON as strings
@@ -62,14 +65,19 @@ dbt/
 mcp/
   cala_mcp/            the MCP server: manifest reader, read-only DuckDB, tools
   tests/               pytest over the built warehouse, incl. reconcile() == []
+extract/
+  cala_extract/        the extractor: outbox-driven dlt source, Postgres fixture loader, CLI
+  tests/               pytest against a Postgres holding cala's DDL and the seeds
 scripts/benchmark_incremental.py
-.github/workflows/ci.yml   build: dbt seed + build; mcp-tests: the same, then pytest
+.github/workflows/ci.yml   build: dbt seed + build; mcp-tests: the same, then pytest;
+                           extract: Postgres service, extractor tests, then dbt + MCP on extracted tables
 ```
 
 ### Lineage
 
 ```mermaid
 flowchart LR
+  PG[(cala Postgres)] -->|cala-extract: outbox-driven| raw
   subgraph raw [raw: cala tables]
     JE[cala_journal_events]
     AE[cala_account_events]
@@ -166,6 +174,19 @@ Things the tests surfaced that were not in the design brief:
   `dbt seed` first, then `dbt build --exclude resource_type:seed`.
 - **No encumbrance-layer entries** occur in cala's suite; only settled and
   pending. The layer is modelled and tested but not exercised by data.
+- **`recorded_at` is not a cursor.** It is caller-supplied or transaction
+  start time (see "Extraction"); 12 fixture entry events are dated a year
+  before they were written. The outbox `sequence` is the cursor, and obix
+  keeps it gap-free.
+- **The outbox is not a complete change signal for templates.** One fixture
+  template has two `initialized` events and one outbox row, and the outbox
+  enum has no `TxTemplateUpdated`. Templates are immutable and tiny, so the
+  extractor replaces that stream instead of keying it.
+- **A snapshot's xmax is not a marker.** It is "latest completed xid + 1",
+  and a running transaction can sit at or above it; the first version of
+  the abandonment proof used it and passed while a transaction was still
+  open. The marker is a real xid taken by an auto-commit statement after
+  the snapshot, as obix does it.
 
 ## Incremental vs full refresh
 
@@ -186,6 +207,112 @@ the rows that are new (1,454, then 0) and the per-id watermark picked up the
 second batch correctly. Its cost scales with new events, not with history.
 This is only valid because `cala_entry_events` is append-only; the mutable
 current-state tables must still be replaced.
+
+## Extraction
+
+`make extract` lands the same 17 tables from a live cala Postgres into the
+`raw` schema the staging models read, so the package runs on real data with
+nothing changed downstream. It is a small [dlt](https://dlthub.com) source
+(`extract/cala_extract/`), the extraction tool lana's platform already uses,
+with two write dispositions that follow the source contract: `merge` for the
+append-only streams, `replace` for the mutable state tables.
+
+### Why the outbox is the cursor
+
+The obvious incremental design, a watermark on `recorded_at`, is wrong for
+es-entity tables, and it took reading the source to see why:
+
+- `recorded_at` is written as `COALESCE($caller_supplied, NOW())`
+  (`es-entity-macros/src/repo/create_fn.rs`). The application can backdate
+  it, and cala's own tests do: the fixtures hold entry events dated
+  2025-01-01 that were written on 2026-09-06. `NOW()` is also transaction
+  *start* time, so even un-backdated rows do not commit in `recorded_at`
+  order (142 inversions in the fixture outbox). A time cursor misses rows.
+- The `*_events` tables have no other candidate: `sequence` restarts at 1
+  per entity.
+- The outbox's `sequence` is the one monotonic cursor in the schema: a
+  `BIGSERIAL` primary key with `CACHE 1`, and obix (cala's outbox library)
+  keeps it gap-free by inserting `payload NULL` placeholder rows for
+  sequences whose transaction rolled back, after proving through the xmin
+  horizon that no writer still owns them (`obix/src/out/gap_fill.rs`).
+- Every entity write is announced on the outbox in the same transaction,
+  with the entity id in the payload. On the seeds the coverage is complete:
+  no id in any keyed stream is missing from the payloads that stream
+  listens to (`test_every_stream_id_is_announced_on_the_outbox`).
+
+So the extractor reads the outbox from its watermark, collects the entity
+ids the payloads name, fetches those entities' `*_events` rows by key, and
+merges on `(id, sequence)`. Two details from the source shaped the mapping:
+an account set's backing account gets no `account_created` of its own (the
+set's payload announces it), and `tx_template_events` is replaced rather
+than keyed because the outbox has no `TxTemplateUpdated` variant and the
+fixtures contain a template with two `initialized` events for one outbox row.
+
+### What one run does
+
+1. Open one `REPEATABLE READ, READ ONLY` transaction and take an xid marker
+   the way obix's `abandonment_marker` does. Everything below is read from
+   that snapshot, so the streams and the replaced state tables describe the
+   same instant and the reconciliation controls hold after every run, not
+   only when cala is idle.
+2. Stream `outbox where sequence > watermark`, page by page; per page, fetch
+   the announced entities' events. Land the outbox rows themselves too.
+3. Replace the 11 state tables.
+4. Advance the watermark only across a contiguous run of sequences. For a
+   hole below the highest sequence seen, apply obix's proof in a fresh
+   transaction: if `pg_snapshot_xmin(pg_current_snapshot()) > marker`, every
+   transaction that could own the hole has ended; a sequence still absent
+   is abandoned and skipped, one that appeared meanwhile is a late commit
+   and the watermark stops before it. If the horizon has not passed, stop
+   at the hole. Rows beyond a hole are still landed (they were in the
+   snapshot) and re-read next run, which is harmless because the merge is
+   idempotent.
+5. With `--verify`, count every table in the snapshot and compare with the
+   destination after the load.
+
+`extract/tests/` runs all of this against a Postgres that holds cala's real
+DDL (`fixtures/schema.sql`, dumped from cala's migrations) and the seeds:
+the first load equals the seeds row for row with the seed column types; a
+second run loads zero stream rows; a half-then-half load lands exactly the
+withheld rows (2,607 outbox rows, 2,166 entry events); an uncommitted
+transaction holding sequence N+1 stalls the watermark at N while N+2 still
+lands, and the commit is picked up next run; burnt sequences are proven
+abandoned and skipped; a placeholder row loads and announces nothing; a
+wiped DuckDB file starts over from 0 (the watermark follows the warehouse,
+not dlt's local state); seed tables in the way are refused unless
+`--full-refresh` drops them.
+
+| run | wall (s) | outbox rows | entry events | balance history (replaced) |
+|---|---:|---:|---:|---:|
+| first load, outbox 1..2600 | 3.0 | 2600 | 1120 | 3340 |
+| incremental, 2601..5207 | 3.2 | 2607 | 2166 | 3340 |
+| incremental, nothing new | 2.5 | 0 | 0 | 3340 |
+
+The streams cost what is new; the state tables cost what they are. The
+biggest of those, `cala_balance_history`, is append-only with a
+server-assigned `recorded_at` and could be loaded by version against the
+replaced `cala_current_balances`; that is the next step, not this one.
+
+### Using it
+
+```sh
+CALA_PG_URL=postgres://...   # a role with SELECT on the cala tables
+make extract                 # cala-extract --verify, into dbt/cala_warehouse.duckdb
+make build-extracted         # dbt build --exclude resource_type:seed
+make mcp-test                # the MCP suite over the extracted warehouse
+```
+
+`cala-extract --full-refresh` drops the landed tables and the watermark.
+`--destination bigquery` lands in a BigQuery dataset with the same names
+(env vars as in `profiles.yml`; `uv sync --group bigquery`; untested against
+a live project, like the dbt target). `make fixture-pg` starts a Docker
+Postgres loaded with the seeds for local runs of `make extract` and
+`make extract-test`. Seeds and extraction both land `raw.cala_*`, so
+`make clean` between `make build` and `make extract`; the extractor refuses
+to load over seed tables and says so.
+
+No orchestrator: run it from cron, Dagster, or a GitHub Action. Every run
+is idempotent.
 
 ## MCP server
 
@@ -234,8 +361,9 @@ snapshot both sides on it.
 
 `profiles.yml` has a `bigquery` target. Dialect differences live in
 `dbt/macros/cross_db.sql` (`adapter.dispatch`), seeds are disabled off DuckDB
-so fixtures never land on a real warehouse, and `sources.yml` names the same
-tables an extractor would land. Untested against a live BigQuery project.
+so fixtures never land on a real warehouse, and `sources.yml` names the
+tables `cala-extract` lands (with `--destination bigquery`, the same names in
+a BigQuery dataset). Untested against a live BigQuery project.
 
 ```sh
 DBT_BIGQUERY_PROJECT=... DBT_BIGQUERY_DATASET=... TARGET=bigquery make run
@@ -257,10 +385,11 @@ is listed in the manifest rather than hidden.
 
 ## Out of scope, deliberately
 
-No ingestion (this package starts at the landed tables), no orchestrator, no
-erasure propagation. An append-only warehouse does not honour es-entity's
-"forgettable" erasure requests; that is a real obligation once raw event JSON
-is landed, and a good next project.
+No orchestrator (the extractor is one idempotent command), no logical
+replication (the outbox gives change data capture without a replication
+slot), no erasure propagation. An append-only warehouse does not honour
+es-entity's "forgettable" erasure requests; that is a real obligation once
+raw event JSON is landed, and a good next project.
 
 No auth on the MCP server either: it is a local stdio process over a local
 file, which is the right shape for v1 and the wrong one for anything shared.
