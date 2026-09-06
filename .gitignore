@@ -4,6 +4,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# dlt (extractor) local pipeline state; the watermark also lives in the warehouse
+.dlt/
+
 # dbt
 dbt/target/
 dbt/dbt_packages/
