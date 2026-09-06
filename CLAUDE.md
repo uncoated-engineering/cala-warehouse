@@ -24,18 +24,26 @@ balances cala itself persisted.
 - `make seed` — load `fixtures/seed/*.csv` into DuckDB (`dbt seed`)
 - `make run` — build models only
 - `make test` — run tests only
-- `make build` — seed + run + test in DAG order (`dbt build`). This is what CI runs.
+- `make build` — `dbt seed`, then `dbt build --exclude resource_type:seed`. This is what CI runs.
+  The two steps are deliberate: staging reads seeds through `source()`, which
+  dbt does not order after seeds, so one `dbt build` races on a fresh database.
+- `make build FULL_REFRESH=1` — rebuild incremental models. Required after `make fixtures`
+  (the seeds are replaced, and `stg_cala_entries` would otherwise keep the old batch).
 - `make docs` — generate the dbt docs site
 - `TARGET=bigquery make build` — same package against BigQuery (needs credentials, see `dbt/profiles.yml`)
 - Single model: `cd dbt && uv run dbt build --select fct_entries+`
 - Single test: `cd dbt && uv run dbt test --select assert_balances_reconcile`
+- Bounded load: `--vars '{"entries_as_of": "2026-01-01T00:00:00"}'` stops `stg_cala_entries` at a watermark
+- Benchmark: `uv run python scripts/benchmark_incremental.py` (needs a seeded database)
 
 ### Fixtures
 - `make fixtures` — regenerate `fixtures/seed/` by running cala's own integration
   test suite in Docker and dumping the resulting tables. Needs Docker and a
   checkout of cala at `../cala` (override with `CALA_DIR=...`).
 - Never hand-edit seed CSVs. They must come from cala's code so the schemas
-  and event sequences are real.
+  and event sequences are real. `fixtures/MANIFEST.md` records which cala
+  produced them and what its test suite reported.
+- Seeds are disabled off the `duckdb` target so fixtures never land on a real warehouse.
 
 ## Architecture Overview
 
@@ -48,6 +56,27 @@ dbt/models/marts/          dims, facts, and the trial balance report
         │
 dbt/tests/                 singular tests = the accounting controls
 ```
+
+### The controls (dbt/tests/)
+| test | invariant |
+|---|---|
+| `assert_debits_equal_credits` | per (transaction, currency), Σ debit units = Σ credit units |
+| `assert_debits_equal_credits_per_layer` | same per (transaction, currency, layer); undocumented in cala, holds empirically |
+| `assert_no_sequence_gaps` | per entity id, sequence = 1..n on every staged stream (completeness) |
+| `assert_balances_reconcile` | `fct_account_balances` = `stg_cala_balances` on the full grain, exact decimals |
+| `assert_account_set_balances_reconcile` | cala's set balances = rollup through `dim_account_set_members`, scoped to the set's journal |
+
+### Things that are easy to get wrong here
+- Account-set membership is NOT in `cala_account_set_events`; it only exists on
+  the outbox. `stg_cala_account_set_members` reads `cala_persistent_outbox_events`.
+- A set belongs to one journal, an account does not. cala rolls a posting only
+  into ancestor sets in the posting's journal. Any set-level aggregate must
+  join the set's `journal_id`.
+- cala writes all three layers on first touch of an (account, currency), so a
+  0/0 layer on cala's side with no entries on ours is a match, not a gap.
+- `layer` and `direction` arrive PascalCase in event JSON (`Settled`) but
+  lowercase in Postgres enums; staging lowercases them.
+- `context` is null in the fixtures (cala's tests set none). Keep the column anyway.
 
 ### Source data contract (from es-entity)
 Every entity has two tables:
