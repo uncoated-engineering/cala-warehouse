@@ -14,7 +14,12 @@ models:
                 to: ref('fct_transactions')
                 field: transaction_id
       - name: account_id
-        tests: [not_null]
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_accounts')
+                field: account_id
       - name: journal_id
         tests: [not_null]
       - name: units
@@ -64,3 +69,43 @@ models:
       - dbt_utils_free_unique_combination:
           arguments:
             combination: [journal_id, currency, layer]
+
+  - name: dim_accounts
+    description: SCD-2 account history, one row per account version.
+    columns:
+      - name: account_version_key
+        tests: [unique, not_null]
+      - name: account_id
+        tests: [not_null]
+      - name: normal_balance_type
+        tests:
+          - accepted_values: {arguments: {values: [debit, credit]}}
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [account_id, version_number]
+      - dbt_utils_free_scd2_single_current:
+          arguments:
+            key_column: account_id
+
+  - name: dim_account_sets
+    columns:
+      - name: account_set_id
+        tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_accounts')
+                field: account_id
+
+  - name: dim_account_set_members
+    description: Transitive closure of set membership; one row per (set, member, path).
+    columns:
+      - name: depth
+        tests:
+          - dbt_utils_free_at_least: {arguments: {value: 1}}
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [account_set_id, member_id, path]
