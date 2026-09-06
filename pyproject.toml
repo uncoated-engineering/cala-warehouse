@@ -1,0 +1,16 @@
+[project]
+name = "cala-warehouse"
+version = "0.1.0"
+description = "Portable dbt package + DuckDB harness for es-entity / cala-ledger event data"
+requires-python = ">=3.12"
+dependencies = [
+    "dbt-core>=1.9",
+    "dbt-duckdb>=1.9",
+    "duckdb>=1.1",
+]
+
+[dependency-groups]
+bigquery = ["dbt-bigquery>=1.9"]
+
+[tool.uv]
+package = false

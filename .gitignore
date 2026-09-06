@@ -1,0 +1,20 @@
+# python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/*.duckdb
+dbt/*.duckdb.wal
+logs/
+
+# fixture generation scratch (the committed seeds live in fixtures/seed/)
+fixtures/raw/
+fixtures/.cargo-cache/
+
+# local overrides
+.env
+.user.yml
