@@ -99,3 +99,7 @@ done
 # Provenance: which cala produced these rows and what its own suite reported.
 CALA_VERSION="$CALA_VERSION" CALA_REV="$CALA_REV" RUST_IMAGE="$RUST_IMAGE" \
   PG_IMAGE="$PG_IMAGE" TEST_STATUS="$TEST_STATUS" "$HERE/manifest.sh"
+
+# The DDL the extractor tests recreate these tables from, kept in step with
+# the seeds (same cala checkout).
+CALA_DIR="$CALA_DIR" PG_IMAGE="$PG_IMAGE" "$HERE/schema.sh"
