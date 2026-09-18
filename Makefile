@@ -7,6 +7,7 @@
 #   make build FULL_REFRESH=1   rebuild incremental models from scratch
 #   make mcp     start the read-only MCP server (stdio) over the built DuckDB file
 #   make mcp-test  pytest for the MCP tools; needs `make build` first
+#   make quality   refresh the quality KPI marts from what the hooks recorded
 #
 # Extraction (from a live cala Postgres instead of seeds; needs CALA_PG_URL):
 #   make extract           land cala's tables in dbt/cala_warehouse.duckdb (raw schema)
@@ -43,7 +44,7 @@ export CALA_PG_URL
 FULL_REFRESH ?=
 DBT_FLAGS    := --target $(TARGET) $(if $(FULL_REFRESH),--full-refresh,)
 
-.PHONY: install seed build test run clean fixtures docs mcp mcp-test \
+.PHONY: install seed build test run clean fixtures docs mcp mcp-test quality \
         extract build-extracted extract-test fixture-pg fixture-pg-stop erase erasures
 
 install:
@@ -67,6 +68,13 @@ build:
 
 docs:
 	cd $(DBT_DIR) && $(DBT) docs generate --target $(TARGET)
+
+# The quality hooks (dbt/macros/quality.sql) record every invocation's test
+# results, row counts and freshness AFTER it ends, so a run's own numbers
+# only reach the KPI marts on the next materialisation. This refreshes just
+# those marts (tag:quality) without re-running the tests.
+quality:
+	cd $(DBT_DIR) && $(DBT) run --target $(TARGET) --select tag:quality
 
 # Also drops dlt's local pipeline state (.dlt/). The extractor would recover
 # on its own (the watermark follows the warehouse, not the local file), but a

@@ -99,3 +99,68 @@ sources:
             description: The entry that produced this version.
           - name: recorded_at
             description: When cala wrote this version. Wall-clock time, not the entry's recorded_at.
+
+  - name: quality
+    description: >
+      Written by this package's own hooks (macros/quality.sql), not by cala:
+      on-run-end appends one row per test result, one row per model built
+      with its row count, and the freshness of the two source streams, keyed
+      by dbt's invocation_id. Append-only; a KPI history, never a source of
+      truth for the ledger.
+    schema: quality
+    tables:
+      - name: dbt_test_results
+        description: One row per (invocation, test). `status` is dbt's own test status.
+        columns:
+          - name: invocation_id
+            description: dbt invocation id, shared by every row the run recorded.
+          - name: run_started_at
+            description: When the invocation started, naive UTC.
+          - name: test_unique_id
+            description: dbt unique_id of the test node.
+          - name: test_name
+            description: Test node name; for singular tests the file name, i.e. the invariant.
+          - name: test_kind
+            description: "singular (a control in dbt/tests/) | generic (a schema.yml test)."
+          - name: generic_test_name
+            description: The generic test macro (unique, not_null, ...); null for singular tests.
+          - name: tested_model
+            description: The model or source the test is attached to, when dbt knows it.
+          - name: status
+            description: "pass | fail | error | warn | skipped."
+          - name: failures
+            description: Rows the test returned; 0 on pass, null when not run.
+          - name: execution_time_s
+            description: dbt's execution time for the test, seconds.
+          - name: message
+            description: dbt's result message, truncated to 1000 characters.
+          - name: recorded_at
+            description: When the hook wrote the row, naive UTC.
+      - name: model_row_counts
+        description: One row per (invocation, model built successfully), count(*) taken right after the run.
+        columns:
+          - name: invocation_id
+          - name: run_started_at
+          - name: model_name
+          - name: relation_name
+            description: The physical relation counted.
+          - name: row_count
+          - name: recorded_at
+      - name: source_freshness
+        description: >
+          Per invocation, the newest recorded_at on cala_entry_events and on
+          the outbox, the outbox's highest sequence, and the lag from that to
+          the invocation's start. Recorded only when the invocation built or
+          tested something.
+        columns:
+          - name: invocation_id
+          - name: run_started_at
+          - name: source_table
+            description: cala_entry_events or cala_persistent_outbox_events.
+          - name: max_recorded_at
+            description: Newest recorded_at in the table at the time of the run.
+          - name: max_sequence
+            description: Highest outbox sequence; null for the entries stream.
+          - name: lag_seconds
+            description: run_started_at minus max_recorded_at, seconds. Backdated events make it larger than the ingestion lag.
+          - name: recorded_at

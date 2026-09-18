@@ -384,3 +384,140 @@ models:
         description: Later extraction runs that found the value re-landed from the source and redacted it again.
       - name: last_reapplied_at
         description: applied_at of the latest re-application, null if none.
+
+  # --- quality layer ---------------------------------------------------------
+  # Facts about past dbt runs, recorded by the package's own hooks
+  # (macros/quality.sql). They report; they never gate a build.
+  - name: fct_test_results
+    description: >
+      One row per test per dbt invocation: status, rows returned, duration,
+      and whether the test is one of the accounting controls. The history
+      behind the pass-rate KPI.
+    config:
+      meta:
+        grain: [invocation_id, test_unique_id]
+    columns:
+      - name: invocation_id
+        description: dbt invocation id of the run that executed the test.
+        tests: [not_null]
+      - name: run_started_at
+        description: When that invocation started, naive UTC.
+      - name: test_unique_id
+        description: dbt unique_id of the test node.
+        tests: [not_null]
+      - name: test_name
+        description: Test node name; for a control, the invariant it proves (assert_...).
+      - name: test_kind
+        description: "singular | generic."
+        tests:
+          - accepted_values: {arguments: {values: [singular, generic]}}
+      - name: generic_test_name
+        description: The generic test macro (unique, not_null, ...); null for singular tests.
+      - name: tested_model
+        description: The model or source the test is attached to, when dbt records it.
+      - name: status
+        description: "pass | fail | error | warn | skipped, as dbt reported it."
+        tests:
+          - accepted_values: {arguments: {values: [pass, fail, error, warn, skipped]}}
+      - name: failures
+        description: Rows the test query returned; 0 on pass, null when the test did not run.
+      - name: execution_time_s
+        description: Seconds dbt spent on the test.
+      - name: message
+        description: dbt's result message, truncated to 1000 characters.
+      - name: is_control
+        description: True for the singular tests in dbt/tests/, i.e. the accounting controls.
+      - name: passed
+        description: status = pass.
+      - name: recorded_at
+        description: When the hook wrote the row, naive UTC.
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [invocation_id, test_unique_id]
+
+  - name: fct_row_count_drift
+    description: >
+      Row count of every model per invocation and its change against the
+      previous invocation that counted the same model. is_outlier flags a
+      change beyond var('row_count_drift_threshold_pct'); a flag, not a failure.
+    config:
+      meta:
+        grain: [invocation_id, model_name]
+    columns:
+      - name: invocation_id
+        description: dbt invocation id of the run that built the model.
+        tests: [not_null]
+      - name: run_started_at
+        description: When that invocation started, naive UTC.
+      - name: model_name
+        description: dbt model name.
+        tests: [not_null]
+      - name: relation_name
+        description: The physical relation that was counted.
+      - name: row_count
+        description: count(*) right after the model was built.
+        tests: [not_null]
+      - name: previous_row_count
+        description: row_count from the previous invocation that counted this model; null on the first.
+      - name: previous_invocation_id
+        description: That previous invocation's id.
+      - name: delta
+        description: row_count - previous_row_count.
+      - name: drift_pct
+        description: delta as a percentage of previous_row_count; null when there is no usable previous count.
+      - name: is_outlier
+        description: abs(drift_pct) above var('row_count_drift_threshold_pct'); false when drift_pct is null.
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [invocation_id, model_name]
+
+  - name: rpt_quality_kpis
+    description: >
+      One row per dbt invocation with the three quality KPIs: test pass rate
+      (and whether every accounting control passed), source freshness lag,
+      and row-count drift. Describes runs that have already finished; the
+      current run's row appears on the next refresh (`make quality`).
+    config:
+      meta:
+        grain: [invocation_id]
+    columns:
+      - name: invocation_id
+        description: dbt invocation id.
+        tests: [unique, not_null]
+      - name: run_started_at
+        description: When the invocation started, naive UTC. The time axis of the KPIs.
+        tests: [not_null]
+      - name: tests_run
+        description: Tests executed in the invocation (0 for a run-only invocation).
+      - name: tests_passed
+        description: Tests with status pass.
+      - name: tests_failed
+        description: Tests with status fail.
+      - name: tests_errored
+        description: Tests with status error.
+      - name: pass_rate
+        description: tests_passed / tests_run, 0..1; null when no tests ran.
+        tests:
+          - dbt_utils_free_between: {arguments: {min_value: 0, max_value: 1}}
+      - name: controls_run
+        description: Singular tests (the accounting controls) executed.
+      - name: controls_passed
+        description: Controls that passed.
+      - name: all_controls_passed
+        description: controls_passed = controls_run; null when no control ran.
+      - name: models_counted
+        description: Models built successfully and counted.
+      - name: rows_total
+        description: Sum of row counts over the counted models.
+      - name: max_abs_drift_pct
+        description: Largest absolute row-count change of any model against its previous build, percent.
+      - name: outlier_models
+        description: Models whose drift crossed var('row_count_drift_threshold_pct').
+      - name: entries_freshness_lag_s
+        description: Seconds from the newest cala_entry_events.recorded_at to the run start. Inflated by backdated entries.
+      - name: outbox_freshness_lag_s
+        description: Seconds from the newest outbox recorded_at to the run start. The ingestion-lag signal.
+      - name: outbox_max_sequence
+        description: Highest outbox sequence in the warehouse at the run.

@@ -11,6 +11,20 @@ macro-paths: [macros]
 target-path: target
 clean-targets: [target, dbt_packages]
 
+# The quality layer records every invocation: on-run-start creates the
+# quality.* tables if missing, on-run-end appends this run's test results,
+# model row counts and source freshness (macros/quality.sql). The hooks
+# record, they never gate; a failing test still fails the build on its own.
+on-run-start:
+  - "{{ quality_ensure_tables() }}"
+on-run-end:
+  - "{{ quality_record_results(results) }}"
+
+vars:
+  # Row-count drift above this (percent, absolute) flags a model in
+  # fct_row_count_drift.is_outlier. A KPI threshold, not a test threshold.
+  row_count_drift_threshold_pct: 20
+
 models:
   cala_warehouse:
     staging:

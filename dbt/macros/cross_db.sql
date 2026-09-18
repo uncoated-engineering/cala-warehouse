@@ -104,3 +104,16 @@
 {% macro bigquery__bool_and_agg(expression) -%}
   logical_and({{ expression }})
 {%- endmacro %}
+
+{#- Seconds from timestamp a to timestamp b (positive when b is later). -#}
+{% macro seconds_between(a, b) -%}
+  {{ return(adapter.dispatch('seconds_between', 'cala_warehouse')(a, b)) }}
+{%- endmacro %}
+
+{% macro default__seconds_between(a, b) -%}
+  date_diff('second', {{ a }}, {{ b }})
+{%- endmacro %}
+
+{% macro bigquery__seconds_between(a, b) -%}
+  timestamp_diff({{ b }}, {{ a }}, second)
+{%- endmacro %}

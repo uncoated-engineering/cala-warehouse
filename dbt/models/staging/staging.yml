@@ -193,3 +193,61 @@ models:
         description: Rows of the table belonging to the entity.
       - name: rows_redacted
         description: Rows that held a value before this run.
+
+  # --- quality layer: what the package's own hooks recorded ----------------
+  - name: stg_quality_test_results
+    description: One row per (invocation, test) as recorded by the on-run-end hook.
+    config:
+      meta:
+        grain: [invocation_id, test_unique_id]
+    columns:
+      - name: invocation_id
+        tests: [not_null]
+      - name: test_unique_id
+        tests: [not_null]
+      - name: test_kind
+        tests:
+          - accepted_values: {arguments: {values: [singular, generic]}}
+      - name: status
+        tests:
+          - accepted_values: {arguments: {values: [pass, fail, error, warn, skipped]}}
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [invocation_id, test_unique_id]
+
+  - name: stg_quality_row_counts
+    description: One row per (invocation, model built) with its row count.
+    config:
+      meta:
+        grain: [invocation_id, model_name]
+    columns:
+      - name: invocation_id
+        tests: [not_null]
+      - name: model_name
+        tests: [not_null]
+      - name: row_count
+        tests:
+          - not_null
+          - dbt_utils_free_non_negative
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [invocation_id, model_name]
+
+  - name: stg_quality_freshness
+    description: One row per (invocation, source stream) with the stream's newest recorded_at and the lag to the run.
+    config:
+      meta:
+        grain: [invocation_id, source_table]
+    columns:
+      - name: invocation_id
+        tests: [not_null]
+      - name: source_table
+        tests:
+          - not_null
+          - accepted_values: {arguments: {values: [cala_entry_events, cala_persistent_outbox_events]}}
+    tests:
+      - dbt_utils_free_unique_combination:
+          arguments:
+            combination: [invocation_id, source_table]
