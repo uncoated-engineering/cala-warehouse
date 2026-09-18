@@ -24,6 +24,7 @@ dev = [
 [project.scripts]
 cala-mcp = "cala_mcp.server:main"
 cala-extract = "cala_extract.cli:main"
+cala-erase = "cala_extract.erase:main"
 
 [build-system]
 requires = ["hatchling"]
