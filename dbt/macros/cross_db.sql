@@ -48,11 +48,13 @@
 {% macro json_object(column, path) -%}
   {{ return(adapter.dispatch('json_object', 'cala_warehouse')(column, path)) }}
 {%- endmacro %}
+{#- A JSON null comes back as the string 'null' from both engines; that is
+    "no object", so it becomes SQL NULL. -#}
 {% macro default__json_object(column, path) -%}
-  cast(json_extract({{ column }}, '$.{{ path }}') as varchar)
+  nullif(cast(json_extract({{ column }}, '$.{{ path }}') as varchar), 'null')
 {%- endmacro %}
 {% macro bigquery__json_object(column, path) -%}
-  json_query({{ column }}, '$.{{ path }}')
+  nullif(json_query({{ column }}, '$.{{ path }}'), 'null')
 {%- endmacro %}
 
 

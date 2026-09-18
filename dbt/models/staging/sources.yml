@@ -25,6 +25,45 @@ sources:
           place account-set membership changes are recorded as events; the
           `*_events` streams do not carry them.
 
+      # --- written by the warehouse itself, not by cala
+      - name: cala_erasure_log
+        description: >
+          The erasure audit log. Appended by `cala-erase` and by every
+          `cala-extract` run (extract/cala_extract/erasure.py), never by cala:
+          one row per (erasure request, raw table redacted). It may not exist
+          on a warehouse that has never erased anything, so models read it
+          through the `optional_source` macro. Never edited, never truncated;
+          `--full-refresh` of the cala tables leaves it in place.
+        columns:
+          - name: log_id
+            description: Unique per row.
+          - name: erasure_id
+            description: One per request. A `reapply` row reuses the id of the request it re-applied.
+          - name: applied_at
+            description: When the redaction ran, naive UTC.
+          - name: run_id
+            description: The dlt load id of the extraction run, or the cala-erase invocation id.
+          - name: source
+            description: "operator | forget_event | cascade | reapply. The first three are requests; reapply is a later run redacting rows upstream re-introduced."
+          - name: requested_by
+            description: Who asked (operator requests), `upstream` for forget events; null otherwise.
+          - name: reason
+            description: Free text from the request, or the forget event that triggered it.
+          - name: entity_kind
+            description: "account | account_set | transaction | entry | journal."
+          - name: entity_id
+            description: The erased entity's id (UUID as string).
+          - name: cascade_of
+            description: For cascade rows, the erasure_id of the parent request (an account erased with its entries).
+          - name: table_name
+            description: The raw table this row redacted (a stream, a state table or the outbox).
+          - name: fields
+            description: JSON array string of the field paths set to null in that table.
+          - name: rows_matched
+            description: Rows of the table that belong to the entity.
+          - name: rows_redacted
+            description: Of those, rows that still held a value in at least one field before this run.
+
       # --- mutable current-state tables (must be replaced, never sequence-watermarked)
       - name: cala_journals
       - name: cala_accounts
