@@ -22,3 +22,6 @@ fixtures/.cargo-cache/
 # local overrides
 .env
 .user.yml
+
+# local agent worktrees
+.claude/

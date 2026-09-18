@@ -14,6 +14,11 @@
 #   make extract-test      pytest for the extractor; needs a throwaway Postgres
 #   make fixture-pg        start a Docker Postgres loaded with the seeds, for the two above
 #
+# Erasure (GDPR / forget propagation; see extract/cala_extract/erasure.py):
+#   make erase ARGS="account <uuid> --reason DSAR-42 --with-entries"
+#                          redact the entity in every landed copy, log it, rebuild the marts
+#   make erasures          print the erasure log
+#
 # `make fixtures` regenerates the seeds by running cala's own integration
 # suite in Docker and dumping the resulting tables. Requires Docker and a
 # checkout of cala at ../cala (override with CALA_DIR).
@@ -39,7 +44,7 @@ FULL_REFRESH ?=
 DBT_FLAGS    := --target $(TARGET) $(if $(FULL_REFRESH),--full-refresh,)
 
 .PHONY: install seed build test run clean fixtures docs mcp mcp-test \
-        extract build-extracted extract-test fixture-pg fixture-pg-stop
+        extract build-extracted extract-test fixture-pg fixture-pg-stop erase erasures
 
 install:
 	uv sync
@@ -107,3 +112,16 @@ fixture-pg:
 
 fixture-pg-stop:
 	docker rm -f cala-fixture-pg >/dev/null 2>&1 || true
+
+# --- erasure ----------------------------------------------------------------
+# `cala-erase` redacts the raw tables and appends to raw.cala_erasure_log;
+# the rebuild re-materialises the marts from the redacted rows (staging views
+# see them at once, tables do not) and runs the control that proves it:
+# assert_erased_entities_hold_no_personal_data. Works on a seeded warehouse
+# and on an extracted one; `make extract` re-applies the log after every run.
+erase:
+	uv run cala-erase $(ARGS)
+	cd $(DBT_DIR) && $(DBT) build $(DBT_FLAGS) --exclude resource_type:seed
+
+erasures:
+	uv run cala-erase list

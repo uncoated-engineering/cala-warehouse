@@ -90,7 +90,8 @@ jobs:
         run: uv sync --frozen
 
       # Round trip, incremental load, in-flight and abandoned outbox
-      # sequences, wiped warehouse. Each test rebuilds the source database.
+      # sequences, wiped warehouse, erasure re-applied across runs and forget
+      # events consumed. Each test rebuilds the source database.
       - name: pytest (extractor against Postgres)
         run: make extract-test
 
@@ -109,6 +110,23 @@ jobs:
 
       - name: dbt build on the extracted tables (no seeds)
         run: make build-extracted
+
+      # Erasure propagation: redact one account and its entries, rebuild,
+      # and let assert_erased_entities_hold_no_personal_data prove it while
+      # the reconciliation controls prove nothing else moved.
+      - name: Erase one account with its entries, rebuild, prove the erasure
+        run: |
+          ACCOUNT=$(uv run python -c "import duckdb; c=duckdb.connect('dbt/cala_warehouse.duckdb', read_only=True); print(c.execute(\"select a.id from raw.cala_accounts a join raw.cala_entries e on e.account_id = a.id where a.name <> '' group by a.id order by count(*) desc, a.id limit 1\").fetchone()[0])")
+          uv run cala-erase account "$ACCOUNT" --with-entries --reason "CI: erasure propagation" --requested-by ci
+          make build-extracted
+
+      # The source still holds the name; the next run replaces cala_accounts
+      # from it and must redact it again before dbt sees it.
+      - name: Extract again re-applies the erasure on the replaced state table
+        run: |
+          uv run cala-extract --verify --json > extract.json
+          python3 -c "import json; s=json.load(open('extract.json')); assert s['erasures_known'] >= 1 and s['erasures_reapplied'].get('cala_accounts') == 1, s"
+          make build-extracted
 
       - name: pytest (MCP tools over the extracted warehouse)
         run: make mcp-test
