@@ -341,3 +341,46 @@ models:
       - dbt_utils_free_unique_combination:
           arguments:
             combination: [account_set_id, member_id, path]
+
+  - name: fct_erasures
+    description: >
+      One row per erasure request: the auditable record of what was erased,
+      why, where, and how often a later extraction run had to redact it again.
+      Rows come from raw.cala_erasure_log, written by cala-erase / cala-extract;
+      empty on a warehouse that has never erased anything.
+    config:
+      meta:
+        grain: [erasure_id]
+    columns:
+      - name: erasure_id
+        description: The request id. Cascade rows (an account erased with its entries) have their own id and point at the parent through cascade_of.
+        tests: [unique, not_null]
+      - name: entity_kind
+        description: "account | account_set | transaction | entry | journal. Account and account set share an id; either kind redacts both."
+        tests:
+          - accepted_values: {arguments: {values: [account, account_set, transaction, entry, journal]}}
+      - name: entity_id
+        description: The erased entity's id (UUID as string).
+        tests: [not_null]
+      - name: erasure_source
+        description: "operator (cala-erase), forget_event (an es-entity `forgot` event consumed by cala-extract) or cascade."
+        tests:
+          - accepted_values: {arguments: {values: [operator, forget_event, cascade]}}
+      - name: requested_by
+        description: Who asked; `upstream` for a forget event.
+      - name: reason
+        description: Free text from the request, or the forget event that triggered it.
+      - name: cascade_of
+        description: Parent erasure_id for cascade rows, else null.
+      - name: run_id
+        description: The extraction load id or cala-erase invocation that applied the request.
+      - name: first_applied_at
+        description: When the request was first applied, naive UTC.
+      - name: tables_touched
+        description: Distinct raw tables redacted for the entity across all rows of the request.
+      - name: rows_redacted_total
+        description: Rows that held a value and were nulled, summed over the request and its re-applications.
+      - name: reapply_count
+        description: Later extraction runs that found the value re-landed from the source and redacted it again.
+      - name: last_reapplied_at
+        description: applied_at of the latest re-application, null if none.
