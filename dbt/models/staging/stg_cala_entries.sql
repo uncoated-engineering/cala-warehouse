@@ -18,6 +18,12 @@
 -- var entries_as_of (optional timestamp): only load events recorded at or
 -- before it. Lets a backfill stop at a watermark, and lets the benchmark in
 -- the README load the seeds in two batches.
+--
+-- Erasure: an erased entry's event JSON is redacted in place in raw, below
+-- the watermark, so the incremental run would never see it again. Every
+-- entry id in the erasure log is re-selected on each run and replaces the
+-- stale row on the unique key. Erasures are rare, so this costs nothing.
+-- depends_on: {{ ref('stg_cala_erasures') }}
 with
 
 {% if is_incremental() %}
@@ -28,6 +34,14 @@ watermark as (
         max(sequence)                                           as max_sequence
     from {{ this }}
     group by 1
+
+),
+
+erased as (
+
+    select entity_id
+    from {{ ref('stg_cala_erasures') }}
+    where entity_kind = 'entry'
 
 ),
 {% endif %}
@@ -42,7 +56,10 @@ source as (
     {% endif %}
     where 1 = 1
     {% if is_incremental() %}
-      and s.sequence > coalesce(w.max_sequence, 0)
+      and (
+          s.sequence > coalesce(w.max_sequence, 0)
+          or s.id in (select entity_id from erased)
+      )
     {% endif %}
     {% if var('entries_as_of', none) %}
       and s.recorded_at <= cast('{{ var("entries_as_of") }}' as timestamp)

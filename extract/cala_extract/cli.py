@@ -4,7 +4,8 @@
 
 No orchestrator: run it from cron, Dagster, a GitHub Action, or by hand.
 Every run is idempotent, so running it twice is safe and the second run
-loads nothing for the streams.
+loads nothing for the streams. After the load, every run honours the forget
+events it landed and re-applies the erasures on record (see erasure.py).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import json
 import os
 import sys
 
+from cala_extract.erasure import FORGET_EVENT_TYPES
 from cala_extract.paths import DEFAULT_DATASET, DEFAULT_DUCKDB, DEFAULT_PIPELINES_DIR
 from cala_extract.pipeline import DESTINATIONS, ForeignTables, extract, format_summary
 
@@ -44,6 +46,11 @@ def main(argv: list[str] | None = None) -> int:
         help="count every source table in the snapshot and compare with the destination after the run",
     )
     parser.add_argument("--page-size", type=int, default=5000)
+    parser.add_argument(
+        "--forget-event-types",
+        default=",".join(FORGET_EVENT_TYPES),
+        help="event types that mean the application forgot the entity; an erasure is filed for each (default: %(default)s)",
+    )
     parser.add_argument("--json", action="store_true", help="print the summary as JSON")
     args = parser.parse_args(argv)
 
@@ -60,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
             full_refresh=args.full_refresh,
             verify=args.verify,
             page_size=args.page_size,
+            forget_event_types=tuple(t.strip() for t in args.forget_event_types.split(",") if t.strip()),
         )
     except ForeignTables as exc:
         print(f"cala-extract: {exc}", file=sys.stderr)

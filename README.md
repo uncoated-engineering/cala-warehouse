@@ -12,9 +12,10 @@ from raw double-entry lines and proves it equals what cala itself persisted.
 
 ```sh
 make install   # uv sync
-make build     # dbt seed, then dbt build: 17 seeds, 14 models, 63 tests, ~10s
+make build     # dbt seed, then dbt build: 17 seeds, 16 models, 75 tests, ~10s
 make mcp       # read-only MCP server (stdio) over the marts; see "MCP server" below
 make extract   # land the same 17 tables from a live cala Postgres; see "Extraction" below
+make erase ARGS="account <uuid> --reason DSAR-42 --with-entries"   # see "Erasure propagation"
 ```
 
 ## What it proves
@@ -30,6 +31,7 @@ after running cala's integration suite (`fixtures/generate.sh`, provenance in
 | `assert_no_sequence_gaps` | per entity id, `sequence` is 1..n with no gaps, on all five event streams | passes; a completeness control |
 | `assert_balances_reconcile` | balances rebuilt from entries = cala's `cala_current_balances`, full grain, exact decimals, zero tolerance | passes on 2,643 (journal, account, currency, layer) rows |
 | `assert_account_set_balances_reconcile` | cala's account-set balances = our rollup through the recursive membership closure | passes on 78 set balance rows |
+| `assert_erased_entities_hold_no_personal_data` | every entity in the erasure log holds no value in its personal fields, in staging, marts, raw state tables and outbox payloads | passes; empty on the seeds, exercised in CI after an erasure |
 
 Plus a trial balance (`rpt_trial_balance`) whose `difference` column is zero on
 all 101 (journal, currency, layer) rows, enforced by a test.
@@ -60,13 +62,14 @@ dbt/
   profiles.yml         targets: duckdb (default), bigquery
   macros/cross_db.sql  json_string / json_decimal / ... dispatch per adapter
   models/staging/      one model per event stream + the outbox + cala's balances
-  models/marts/        dims, facts, trial balance; every column described in marts.yml
-  tests/               the five controls above
+  models/marts/        dims, facts, trial balance, the erasure log; every column described in marts.yml
+  tests/               the six controls above
 mcp/
   cala_mcp/            the MCP server: manifest reader, read-only DuckDB, tools
   tests/               pytest over the built warehouse, incl. reconcile() == []
 extract/
-  cala_extract/        the extractor: outbox-driven dlt source, Postgres fixture loader, CLI
+  cala_extract/        the extractor: outbox-driven dlt source, Postgres fixture loader, CLI;
+                       erasure.py + erase.py: forget propagation and the cala-erase CLI
   tests/               pytest against a Postgres holding cala's DDL and the seeds
 scripts/benchmark_incremental.py
 .github/workflows/ci.yml   build: dbt seed + build; mcp-tests: the same, then pytest;
@@ -105,6 +108,9 @@ flowchart LR
   stg_cala_balances -.-> reconcile
   dim_account_set_members -.-> reconcile_sets{{assert_account_set_balances_reconcile}}
   fct_account_balances -.-> reconcile_sets
+  EL[cala_erasure_log] --> stg_cala_erasures --> fct_erasures
+  stg_cala_erasures -.->|re-select erased ids| stg_cala_entries
+  stg_cala_erasures -.-> erased{{assert_erased_entities_hold_no_personal_data}}
 ```
 
 ## The source contract, in three rules
@@ -314,12 +320,93 @@ to load over seed tables and says so.
 No orchestrator: run it from cron, Dagster, or a GitHub Action. Every run
 is idempotent.
 
+## Erasure propagation
+
+An append-only warehouse does not forget. es-entity keeps personal data out
+of the durable event stream (`Forgettable<T>` fields live in a
+`_forgettable_payloads` row and serialise as `null`, so `forget()` can delete
+the payload and leave the events intact), but **cala declares no forgettable
+field**: whatever an application writes into an account's, transaction's or
+entry's `name`, `description`, `external_id` and `metadata` is durable in
+cala and lands here three times: in the event JSON, in the current-state
+table, and in the outbox payload that announced the write. `cala-erase` and
+the extractor together are the warehouse's `forget()`.
+
+**An erasure is targeted deletion.** For one entity, the personal fields
+above are set to null in every landed copy: its events, its state row, the
+outbox payloads naming it. Nothing else changes: no entry, amount, id,
+sequence or timestamp is touched, so the reconciliation controls hold after
+an erasure exactly as before; the new control
+`assert_erased_entities_hold_no_personal_data` proves the erasure itself,
+looking at every place a value could survive (staging views, the marts that
+carry the fields, the raw state tables, the outbox payloads). It is the
+warehouse-side counterpart of es-entity's `verify_forgotten`.
+
+**Three ways an erasure starts**, one log:
+
+| source | how |
+|---|---|
+| `forget_event` | es-entity's convention is to stage an empty `Forgot {}` before `forget()`, so the erasure is on the stream and the outbox announces it. Every `cala-extract` run looks for `event_type = 'forgot'` (configurable, `--forget-event-types`) among the rows it just landed and erases the entity. cala emits no such event today; the mechanism is there for the services that do. |
+| `operator` | `cala-erase account <uuid> --reason DSAR-42 --requested-by ops`, for the data-subject request that arrives out of band. `--with-entries` cascades to the entries posted to the account (their description and metadata), logged as `cascade` rows with `cascade_of` set. |
+| `reapply` | Not a request: the extractor re-applying every erasure on record to the rows a run just landed. |
+
+**An erasure is a standing fact, not an UPDATE.** cala still holds the data,
+every run replaces the 11 state tables from it, and a re-announced entity has
+its events re-merged. So after each load the extractor re-applies the log to
+exactly the rows that run landed (by `_dlt_load_id`), and when that redacts
+something again it says so: a `reapply` row in the log is the audit trail of
+"upstream still holds this and we scrubbed it again". `--full-refresh` drops
+the raw tables but never the log (it is its own dlt source) and re-applies
+it after the reload.
+
+**The log** (`raw.cala_erasure_log`, append-only, surfaced as `fct_erasures`
+and through the MCP `erasures` tool) records what was erased (table, fields,
+rows matched and redacted) and why (source, requester, reason, run id),
+never the values. No hash of the erased data is kept either: a salted hash
+of a name is still a name to anyone with a dictionary.
+
+**Re-materialising.** The staging views read the redacted rows at once; the
+marts are tables and do not. `make erase ARGS=...` runs `cala-erase` and then
+`dbt build`, which rebuilds them and runs the control. `stg_cala_entries` is
+incremental with a per-id watermark, so an erased entry (below the watermark,
+redacted in place) is re-selected from the log on every run and replaces the
+stale row on its unique key.
+
+```sh
+make erase ARGS="account 01a07757-... --reason DSAR-42 --requested-by ops --with-entries"
+make erasures              # the log
+uv run cala-erase reapply  # re-redact every logged erasure on every row, e.g. after a manual reload
+```
+
+Tested in `extract/tests/test_erase.py`: every copy is redacted and the
+accounting rows are byte-for-byte unchanged; a cascade reaches every entry of
+the account and none of its amounts; a repeat request is logged and redacts
+nothing; the next extraction re-lands the name from cala's `cala_accounts`
+and the run redacts it again with a `reapply` row; an `updated` event
+re-merges the account's events and they are redacted again, new event
+included; a full refresh keeps the log; a `forgot` event on the stream is
+honoured on the run that lands it and never filed twice. CI erases an account
+with its entries on the extracted warehouse, rebuilds, extracts again and
+rebuilds, with the six controls green throughout.
+
+### Finding: cala has no forgettable fields
+
+`grep -r Forgettable cala/` finds nothing, and none of cala's 17 tables is a
+`_forgettable_payloads` table. Every value in cala's event JSON is durable
+upstream, so the warehouse cannot rely on the source to forget and must keep
+the erasure as its own standing policy. The design here is generic over
+es-entity's contract (event stream + state table + outbox), so it applies
+unchanged to a service that does use `Forgettable<T>`: there the payload
+tables are simply never extracted (they are not in `ALL_TABLES`), and the
+`forgot` event is what triggers the redaction of anything the application
+still put in plain fields.
+
 ## MCP server
 
 `make mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io)
 server over the DuckDB file dbt produces, so an agent can ask ledger
 questions in ledger terms instead of writing SQL against tables it has to
-guess the meaning of. Five read-only tools:
+guess the meaning of. Six read-only tools:
 
 | tool | answers |
 |---|---|
@@ -328,6 +415,7 @@ guess the meaning of. Five read-only tools:
 | `trial_balance(journal_id, as_of=None)` | `rpt_trial_balance` for one journal; with `as_of`, recomputed from `fct_entries` where `recorded_at <= as_of` |
 | `explain_account_balance(account_id, currency, layer, journal_id=None, limit=200)` | the `fct_account_balances` row(s) and the ordered entry chain with running debit, credit and signed totals, plus cala's own figure for the grain |
 | `reconcile(as_of=None, limit=500)` | the leaf and account-set reconciliation controls; `mismatches` is empty when green. With `as_of`, cala's side comes from `cala_balance_history` |
+| `erasures(entity_id=None, limit=100)` | the erasure log from `fct_erasures`: what was redacted, on whose request, and how often a later run had to redact it again |
 
 Rules the server keeps:
 
@@ -376,6 +464,11 @@ make fixtures                 # needs Docker, psql, and cala at ../cala
 make build FULL_REFRESH=1     # the incremental table must be rebuilt after seeds are replaced
 ```
 
+`FULL_REFRESH=1` is also needed once on a warehouse built before the
+`json_object` fix (a JSON `null` metadata used to land as the string `'null'`
+in `stg_cala_entries`; it is now SQL NULL, and the incremental table keeps
+its old rows until rebuilt).
+
 `generate.sh` starts Postgres 18, runs `cargo test --workspace` for cala in a
 `rust:1-bookworm` container (compile artefacts are cached in Docker volumes,
 so the first run takes several minutes and later ones about one), dumps the
@@ -387,9 +480,9 @@ is listed in the manifest rather than hidden.
 
 No orchestrator (the extractor is one idempotent command), no logical
 replication (the outbox gives change data capture without a replication
-slot), no erasure propagation. An append-only warehouse does not honour
-es-entity's "forgettable" erasure requests; that is a real obligation once
-raw event JSON is landed, and a good next project.
+slot), no crypto-shredding: erasure here is targeted deletion, which is
+verifiable in place; per-entity keys would only earn their complexity if a
+retention rule required the value to survive the request for a while.
 
 No auth on the MCP server either: it is a local stdio process over a local
 file, which is the right shape for v1 and the wrong one for anything shared.

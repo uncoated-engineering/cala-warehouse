@@ -25,7 +25,8 @@ Balances live at (journal_id, account_id, currency, layer); layer is one of
 settled | pending | encumbrance and must never be summed across. Amounts are
 exact decimals returned as strings. Timestamps are naive UTC ISO-8601.
 Start with describe_model to learn a model's columns, grain and lineage;
-nothing here accepts SQL.
+nothing here accepts SQL. `erasures` lists what was redacted under an
+erasure request; a null name or metadata on an erased entity is not a gap.
 """
 
 
@@ -86,6 +87,11 @@ def build_server() -> MCPServer:
     @anticipated
     def reconcile(as_of: str | None = None, limit: int = 500) -> dict[str, Any]:
         return tools.reconcile(as_of, limit, manifest_path=DEFAULT_MANIFEST, duckdb_path=DEFAULT_DUCKDB)
+
+    @server.tool(description=tools.erasures.__doc__)
+    @anticipated
+    def erasures(entity_id: str | None = None, limit: int = 100) -> dict[str, Any]:
+        return tools.erasures(entity_id, limit, manifest_path=DEFAULT_MANIFEST, duckdb_path=DEFAULT_DUCKDB)
 
     return server
 

@@ -149,3 +149,47 @@ models:
       - dbt_utils_free_unique_combination:
           arguments:
             combination: [journal_id, account_id, currency, layer]
+
+  - name: stg_cala_erasures
+    description: >
+      The erasure audit log, one row per (request, raw table redacted) plus
+      one row per later re-application. Written by the warehouse, not cala.
+    config:
+      meta:
+        grain: [log_id]
+    columns:
+      - name: log_id
+        description: Unique per row.
+        tests: [unique, not_null]
+      - name: erasure_id
+        description: One per request; reapply rows reuse it.
+        tests: [not_null]
+      - name: applied_at
+        description: When the redaction ran, naive UTC.
+      - name: run_id
+        description: Extraction load id or cala-erase invocation id.
+      - name: erasure_source
+        description: "operator | forget_event | cascade are requests; reapply is a later run redacting re-landed rows."
+        tests:
+          - accepted_values: {arguments: {values: [operator, forget_event, cascade, reapply]}}
+      - name: requested_by
+        description: Requester, or `upstream` for a forget event.
+      - name: reason
+        description: Free text from the request.
+      - name: entity_kind
+        description: "account | account_set | transaction | entry | journal."
+        tests:
+          - accepted_values: {arguments: {values: [account, account_set, transaction, entry, journal]}}
+      - name: entity_id
+        description: The erased entity's id.
+        tests: [not_null]
+      - name: cascade_of
+        description: Parent erasure_id for cascade rows.
+      - name: table_name
+        description: The raw table redacted.
+      - name: fields
+        description: JSON array string of the field paths nulled.
+      - name: rows_matched
+        description: Rows of the table belonging to the entity.
+      - name: rows_redacted
+        description: Rows that held a value before this run.

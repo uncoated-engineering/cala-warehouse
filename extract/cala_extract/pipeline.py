@@ -13,6 +13,15 @@ from typing import Any
 
 import dlt
 
+from cala_extract.erasure import (
+    FORGET_EVENT_TYPES,
+    LogRow,
+    Store,
+    consume_forget_events,
+    known_erasures,
+    reapply,
+    write_log,
+)
 from cala_extract.paths import DEFAULT_DATASET, DEFAULT_DUCKDB, DEFAULT_PIPELINES_DIR
 from cala_extract.source import OUTBOX, RunState, Snapshot, cala_source
 from cala_extract.tables import ALL_TABLES, STATE, STREAMS
@@ -33,6 +42,12 @@ class RunSummary:
     rows_loaded: dict[str, int]
     # table -> (source rows in the snapshot, destination rows after the run)
     verified: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # entities newly erased because this run landed a forget event for them
+    forget_events: int = 0
+    # table -> rows this run landed that a standing erasure had to redact again
+    erasures_reapplied: dict[str, int] = field(default_factory=dict)
+    # erasures on record after the run (original requests, not re-applies)
+    erasures_known: int = 0
 
     @property
     def verification_failures(self) -> dict[str, tuple[int, int]]:
@@ -119,6 +134,7 @@ def extract(
     full_refresh: bool = False,
     verify: bool = False,
     page_size: int = 5000,
+    forget_event_types: tuple[str, ...] = FORGET_EVENT_TYPES,
 ) -> RunSummary:
     pipeline = build_pipeline(
         destination, duckdb_path=duckdb_path, dataset=dataset, pipelines_dir=pipelines_dir
@@ -139,13 +155,32 @@ def extract(
         source = cala_source(
             snapshot, run, source_url=source_url, watermark=watermark, page_size=page_size, verify=verify
         )
-        pipeline.run(source, refresh="drop_resources" if full_refresh else None)
+        info = pipeline.run(source, refresh="drop_resources" if full_refresh else None)
     finally:
         snapshot.close()
 
     normalize = pipeline.last_trace.last_normalize_info
     counts = normalize.row_counts if normalize else {}
     rows_loaded = {t: int(counts.get(t, 0)) for t in ALL_TABLES}
+
+    # Erasure propagation, on exactly the rows this run landed: honour any
+    # forget event that arrived, then re-apply every standing erasure (the
+    # state tables were just replaced from a source that still holds the
+    # data, and a re-announced entity's events were re-merged). See erasure.py.
+    load_ids = list(info.loads_ids)
+    run_id = load_ids[-1] if load_ids else f"cala-extract:{os.getpid()}"
+    log_rows: list[LogRow] = []
+    with Store(pipeline) as store:
+        forgotten = consume_forget_events(store, load_ids, run_id, forget_event_types)
+        log_rows += forgotten
+        reapplied = reapply(store, load_ids, run_id)
+        log_rows += reapplied
+    write_log(pipeline, log_rows)
+    erasures_reapplied: dict[str, int] = {}
+    for row in reapplied:
+        erasures_reapplied[row.table_name] = erasures_reapplied.get(row.table_name, 0) + row.rows_redacted
+    with Store(pipeline) as store:
+        erasures_known = len(known_erasures(store))
 
     verified: dict[str, tuple[int, int]] = {}
     if verify:
@@ -165,6 +200,9 @@ def extract(
         abandoned=run.abandoned,
         rows_loaded=rows_loaded,
         verified=verified,
+        forget_events=len({r.erasure_id for r in forgotten}),
+        erasures_reapplied=erasures_reapplied,
+        erasures_known=erasures_known,
     )
 
 
@@ -198,6 +236,17 @@ def format_summary(s: RunSummary) -> str:
             "verify: OK, every table matches the snapshot"
             if not s.verification_failures
             else f"verify: FAILED for {sorted(s.verification_failures)}"
+        )
+    if s.erasures_known or s.forget_events:
+        lines.append("")
+        lines.append(
+            f"erasures: {s.erasures_known} on record, {s.forget_events} new from forget events this run"
+            + (
+                ", re-applied on landed rows: "
+                + ", ".join(f"{t} {n}" for t, n in sorted(s.erasures_reapplied.items()))
+                if s.erasures_reapplied
+                else ", nothing to re-apply"
+            )
         )
     return "\n".join(lines)
 
