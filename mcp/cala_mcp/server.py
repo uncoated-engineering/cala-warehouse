@@ -93,6 +93,11 @@ def build_server() -> MCPServer:
     def erasures(entity_id: str | None = None, limit: int = 100) -> dict[str, Any]:
         return tools.erasures(entity_id, limit, manifest_path=DEFAULT_MANIFEST, duckdb_path=DEFAULT_DUCKDB)
 
+    @server.tool(description=tools.quality_kpis.__doc__)
+    @anticipated
+    def quality_kpis(last_n: int = 10) -> dict[str, Any]:
+        return tools.quality_kpis(last_n, manifest_path=DEFAULT_MANIFEST, duckdb_path=DEFAULT_DUCKDB)
+
     return server
 
 

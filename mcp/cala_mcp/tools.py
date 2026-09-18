@@ -673,3 +673,74 @@ def erasures(
         )
     return result
 
+
+# ------------------------------------------------------------- quality KPIs
+
+def quality_kpis(
+    last_n: int = 10,
+    *,
+    manifest_path: Path | str = DEFAULT_MANIFEST,
+    duckdb_path: Path | str = DEFAULT_DUCKDB,
+) -> dict[str, Any]:
+    """The quality KPIs tracked over dbt runs: test pass rate (and whether
+    every accounting control passed), source freshness lag, and row-count
+    drift, newest run first.
+
+    Returns the last_n rows of rpt_quality_kpis, the tests that failed or
+    errored in the latest recorded run, and the models whose row count
+    moved past the drift threshold in that run. The package's own hooks
+    record every invocation after it ends, so the latest row describes the
+    previous build; `make quality` refreshes the marts.
+    """
+    manifest = _manifest(manifest_path)
+    kpis = manifest.model("rpt_quality_kpis")
+    tests = manifest.model("fct_test_results")
+    drift = manifest.model("fct_row_count_drift")
+
+    kpi_cols = ["invocation_id", "run_started_at", "tests_run", "tests_passed", "tests_failed",
+                "tests_errored", "pass_rate", "controls_run", "controls_passed", "all_controls_passed",
+                "models_counted", "rows_total", "max_abs_drift_pct", "outlier_models",
+                "entries_freshness_lag_s", "outbox_freshness_lag_s", "outbox_max_sequence"]
+    kpis.require(*kpi_cols)
+    test_cols = ["test_name", "test_kind", "tested_model", "status", "failures", "message"]
+    tests.require("invocation_id", "passed", *test_cols)
+    drift_cols = ["model_name", "row_count", "previous_row_count", "delta", "drift_pct"]
+    drift.require("invocation_id", "is_outlier", *drift_cols)
+
+    with open_warehouse(duckdb_path) as wh:
+        runs = wh.query(
+            f"select {_select_list(kpis, *kpi_cols)} from {kpis.relation_name} "
+            f"order by {kpis.col('run_started_at')} desc, {kpis.col('invocation_id')} limit ?",
+            [max(last_n, 1)],
+        )
+        failing: list[dict[str, Any]] = []
+        outliers: list[dict[str, Any]] = []
+        if runs:
+            latest = runs[0]["invocation_id"]
+            failing = wh.query(
+                f"select {_select_list(tests, *test_cols)} from {tests.relation_name} "
+                f"where {tests.col('invocation_id')} = ? and not {tests.col('passed')} "
+                f"order by {tests.col('test_name')}",
+                [latest],
+            )
+            outliers = wh.query(
+                f"select {_select_list(drift, *drift_cols)} from {drift.relation_name} "
+                f"where {drift.col('invocation_id')} = ? and {drift.col('is_outlier')} "
+                f"order by {drift.col('model_name')}",
+                [latest],
+            )
+
+    result: dict[str, Any] = {
+        "source": f"{kpis.name}; failing tests from {tests.name}; outliers from {drift.name}",
+        "grain": list(kpis.grain),
+        "runs": runs,
+        "latest_invocation_id": runs[0]["invocation_id"] if runs else None,
+        "latest_failing_tests": failing,
+        "latest_drift_outliers": outliers,
+    }
+    if not runs:
+        result["note"] = (
+            "no runs recorded yet: the hooks record an invocation after it ends, so the first "
+            "rows appear after a second `make build` (or `make quality`)"
+        )
+    return result
