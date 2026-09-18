@@ -56,6 +56,15 @@ balances cala itself persisted.
 - Single test: `uv run pytest extract/tests -k in_flight`
 - `uv run cala-extract --json`, `--full-refresh`, `--destination bigquery`, `--page-size N`
 - `uv run python -m cala_extract.fixture_db $URL` — load schema + seeds into any Postgres
+- `uv run cala-extract --forget-event-types forgot,erased` — event types that file an erasure (default `forgot`)
+
+### Erasure (extract/cala_extract/erasure.py)
+- `make erase ARGS="account <uuid> --reason DSAR-42 --requested-by ops --with-entries"` — `cala-erase`, then
+  `dbt build --exclude resource_type:seed` so the marts are re-materialised and the control runs
+- `make erasures` — print `raw.cala_erasure_log`; `uv run cala-erase reapply` re-redacts every logged erasure on every row
+- `uv run cala-erase account-set|transaction|entry|journal <uuid> --reason ...`
+- Tests: `uv run pytest extract/tests/test_erase.py`; the first half runs on a DuckDB file filled from the seeds
+  (no Postgres), the Postgres half (`-k "reapplied or forget"`) needs `CALA_PG_URL`
 
 ### Fixtures
 - `make fixtures` — regenerate `fixtures/seed/` by running cala's own integration
@@ -109,6 +118,7 @@ extract/tests/             pytest against that Postgres; needs CALA_PG_URL
 | `assert_no_sequence_gaps` | per entity id, sequence = 1..n on every staged stream (completeness) |
 | `assert_balances_reconcile` | `fct_account_balances` = `stg_cala_balances` on the full grain, exact decimals |
 | `assert_account_set_balances_reconcile` | cala's set balances = rollup through `dim_account_set_members`, scoped to the set's journal |
+| `assert_erased_entities_hold_no_personal_data` | for every entity in `stg_cala_erasures`, no personal field holds a value in staging, the marts that carry it, the raw state tables or the outbox payloads |
 
 ### Things that are easy to get wrong here
 - Account-set membership is NOT in `cala_account_set_events`; it only exists on
@@ -144,6 +154,34 @@ extract/tests/             pytest against that Postgres; needs CALA_PG_URL
 - Tests assert on `RunSummary` (watermarks, `rows_loaded`, `stalled_at`,
   `abandoned`, `verification_failures`) and on row-for-row equality with the
   seeds via `warehouse_checks.assert_raw_equals_seeds`.
+
+### Erasure rules (extract/cala_extract/erasure.py)
+- An erasure is targeted deletion of the personal fields in `KINDS` (name,
+  description, external_id, metadata, as far as the entity has them) in every
+  landed copy: the `*_events` JSON, the state row, the outbox payload. It never
+  touches an amount, id, sequence, timestamp or `fields` array, so the
+  reconciliation controls are unaffected; `assert_erased_entities_hold_no_personal_data`
+  mirrors `KINDS` field for field. Change one, change the other.
+- The log (`cala_erasure_log`) is append-only and is its own dlt source
+  (`cala_warehouse`), so `--full-refresh` (which drops the `cala` source's
+  resources) never drops it. It records tables, fields and row counts, never
+  values and never hashes of values.
+- Every `extract()` re-applies the log to the rows the run landed
+  (`_dlt_load_id in loads_ids`) and logs a `reapply` row only when something
+  was actually redacted again. Do not add a load path that bypasses
+  `reapply`, and keep the personal fields out of any new table's replace path
+  unless `KINDS` covers it.
+- Forget detection reads `event_type in FORGET_EVENT_TYPES` on the rows a run
+  landed and files one erasure per entity, once (`source = 'forget_event'`).
+  cala emits no such event; the tests insert one the way an es-entity service
+  would (`Forgot {}` staged before `forget()`, announced on the outbox).
+- `Store` runs on dlt's sql client with `%s` placeholders (dlt rewrites them
+  per destination); no destination-specific SQL, no JSON functions in SQL:
+  the JSON is rewritten in Python row by row, so the same code runs on
+  DuckDB and BigQuery.
+- `stg_cala_entries` re-selects erased entry ids on every incremental run;
+  the other staging models are views and need nothing. A mart that carries a
+  personal field must be listed in the control's `holders`.
 
 ### MCP server rules (mcp/)
 - Every identifier in a query comes from the manifest: `manifest.model(name)`
@@ -220,4 +258,4 @@ explicitly says it is producing an "available" balance.
 
 ### Commits
 - Conventional commits: `feat(scope):`, `fix(scope):`, `test:`, `docs:`, `chore:`.
-- Scope is the layer: `fixtures`, `staging`, `marts`, `tests`, `ci`, `mcp`, `extract`.
+- Scope is the layer: `fixtures`, `staging`, `marts`, `tests`, `ci`, `mcp`, `extract`, `erasure`.
