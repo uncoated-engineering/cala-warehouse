@@ -608,3 +608,68 @@ def reconcile(
         "is_reconciled": not mismatches and not any(c["mismatches_truncated"] for c in controls),
         "caveats": caveats,
     }
+
+
+# ---------------------------------------------------------------- erasures
+
+def erasures(
+    entity_id: str | None = None,
+    limit: int = 100,
+    *,
+    manifest_path: Path | str = DEFAULT_MANIFEST,
+    duckdb_path: Path | str = DEFAULT_DUCKDB,
+) -> dict[str, Any]:
+    """The erasure audit log: which entities had their personal fields
+    redacted in the warehouse, on whose request, what it touched, and how
+    many later extraction runs had to redact them again because the source
+    still holds the value.
+
+    One item per request from fct_erasures, newest first; `entity_id`
+    narrows to one entity (an account and its account set share an id).
+    Amounts, ids and sequences are never part of an erasure, so balances
+    and reconciliation are unaffected; the dbt control
+    assert_erased_entities_hold_no_personal_data proves each erasure holds.
+    """
+    manifest = _manifest(manifest_path)
+    rel = manifest.model("fct_erasures")
+    cols = ["erasure_id", "entity_kind", "entity_id", "erasure_source", "requested_by", "reason",
+            "cascade_of", "run_id", "first_applied_at", "tables_touched", "rows_redacted_total",
+            "reapply_count", "last_reapplied_at"]
+    rel.require(*cols)
+    params: list[Any] = []
+    where = ""
+    if entity_id:
+        where = f" where {rel.col('entity_id')} = ?"
+        params.append(entity_id)
+    with open_warehouse(duckdb_path) as wh:
+        items = wh.query(
+            f"select {_select_list(rel, *cols)} from {rel.relation_name}{where} "
+            f"order by {rel.col('first_applied_at')} desc, {rel.col('erasure_id')} limit ?",
+            [*params, max(limit, 0)],
+        )
+        totals = wh.one(
+            f"select count(*) as requests, count(distinct {rel.col('entity_id')}) as entities, "
+            f"sum({rel.col('reapply_count')}) as reapplies from {rel.relation_name}{where}",
+            params,
+        ) or {}
+    by_source: dict[str, int] = {}
+    for it in items:
+        by_source[it["erasure_source"]] = by_source.get(it["erasure_source"], 0) + 1
+    result: dict[str, Any] = {
+        "entity_id": entity_id,
+        "grain": list(rel.grain),
+        "requests_total": int(totals.get("requests") or 0),
+        "entities_total": int(totals.get("entities") or 0),
+        "reapplies_total": int(totals.get("reapplies") or 0),
+        "shown": len(items),
+        "by_source_shown": by_source,
+        "erasures": items,
+        "source": f"{rel.name}; proof: assert_erased_entities_hold_no_personal_data",
+    }
+    if not items:
+        result["note"] = (
+            f"no erasure on record for {entity_id!r}" if entity_id
+            else "nothing has been erased in this warehouse (no cala-erase request, no forget event landed)"
+        )
+    return result
+

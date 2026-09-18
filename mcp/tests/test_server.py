@@ -8,7 +8,7 @@ import pytest
 
 from cala_mcp.server import build_server
 
-TOOLS = {"describe_model", "list_models", "trial_balance", "explain_account_balance", "reconcile"}
+TOOLS = {"describe_model", "list_models", "trial_balance", "explain_account_balance", "reconcile", "erasures"}
 
 
 def call(tool, **arguments):
