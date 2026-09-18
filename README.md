@@ -12,7 +12,7 @@ from raw double-entry lines and proves it equals what cala itself persisted.
 
 ```sh
 make install   # uv sync
-make build     # dbt seed, then dbt build: 17 seeds, 14 models, 63 tests, ~10s
+make build     # dbt seed, then dbt build: 17 seeds, 16 models, 75 tests, ~10s
 make mcp       # read-only MCP server (stdio) over the marts; see "MCP server" below
 make extract   # land the same 17 tables from a live cala Postgres; see "Extraction" below
 make erase ARGS="account <uuid> --reason DSAR-42 --with-entries"   # see "Erasure propagation"
@@ -463,6 +463,11 @@ DBT_BIGQUERY_PROJECT=... DBT_BIGQUERY_DATASET=... TARGET=bigquery make run
 make fixtures                 # needs Docker, psql, and cala at ../cala
 make build FULL_REFRESH=1     # the incremental table must be rebuilt after seeds are replaced
 ```
+
+`FULL_REFRESH=1` is also needed once on a warehouse built before the
+`json_object` fix (a JSON `null` metadata used to land as the string `'null'`
+in `stg_cala_entries`; it is now SQL NULL, and the incremental table keeps
+its old rows until rebuilt).
 
 `generate.sh` starts Postgres 18, runs `cargo test --workspace` for cala in a
 `rust:1-bookworm` container (compile artefacts are cached in Docker volumes,
