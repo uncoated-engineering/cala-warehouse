@@ -16,6 +16,7 @@ make build     # dbt seed, then dbt build: 17 seeds, 16 models, 75 tests, ~10s
 make mcp       # read-only MCP server (stdio) over the marts; see "MCP server" below
 make extract   # land the same 17 tables from a live cala Postgres; see "Extraction" below
 make erase ARGS="account <uuid> --reason DSAR-42 --with-entries"   # see "Erasure propagation"
+make quality   # refresh the KPI marts (pass rate, freshness, drift); see "Quality KPIs" below
 ```
 
 ## What it proves
@@ -61,8 +62,10 @@ dbt/
   dbt_project.yml      seeds typed per table; UUIDs as strings, JSON as strings
   profiles.yml         targets: duckdb (default), bigquery
   macros/cross_db.sql  json_string / json_decimal / ... dispatch per adapter
+  macros/quality.sql   on-run-start / on-run-end hooks that record every invocation
   models/staging/      one model per event stream + the outbox + cala's balances
-  models/marts/        dims, facts, trial balance, the erasure log; every column described in marts.yml
+                       + stg_quality_*: what the hooks recorded
+  models/marts/        dims, facts, trial balance, the erasure log, the quality KPIs; every column described in marts.yml
   tests/               the six controls above
 mcp/
   cala_mcp/            the MCP server: manifest reader, read-only DuckDB, tools
@@ -111,6 +114,14 @@ flowchart LR
   EL[cala_erasure_log] --> stg_cala_erasures --> fct_erasures
   stg_cala_erasures -.->|re-select erased ids| stg_cala_entries
   stg_cala_erasures -.-> erased{{assert_erased_entities_hold_no_personal_data}}
+  subgraph quality [quality: written by the hooks after every run]
+    QT[dbt_test_results]
+    QC[model_row_counts]
+    QF[source_freshness]
+  end
+  QT --> stg_quality_test_results --> fct_test_results --> rpt_quality_kpis
+  QC --> stg_quality_row_counts --> fct_row_count_drift --> rpt_quality_kpis
+  QF --> stg_quality_freshness --> rpt_quality_kpis
 ```
 
 ## The source contract, in three rules
@@ -406,7 +417,7 @@ still put in plain fields.
 `make mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io)
 server over the DuckDB file dbt produces, so an agent can ask ledger
 questions in ledger terms instead of writing SQL against tables it has to
-guess the meaning of. Six read-only tools:
+guess the meaning of. Seven read-only tools:
 
 | tool | answers |
 |---|---|
@@ -416,6 +427,7 @@ guess the meaning of. Six read-only tools:
 | `explain_account_balance(account_id, currency, layer, journal_id=None, limit=200)` | the `fct_account_balances` row(s) and the ordered entry chain with running debit, credit and signed totals, plus cala's own figure for the grain |
 | `reconcile(as_of=None, limit=500)` | the leaf and account-set reconciliation controls; `mismatches` is empty when green. With `as_of`, cala's side comes from `cala_balance_history` |
 | `erasures(entity_id=None, limit=100)` | the erasure log from `fct_erasures`: what was redacted, on whose request, and how often a later run had to redact it again |
+| `quality_kpis(last_n=10)` | the last runs of `rpt_quality_kpis` (pass rate, controls, freshness lag, drift), the tests that failed in the latest recorded run, and its drift outliers |
 
 Rules the server keeps:
 
@@ -444,6 +456,49 @@ and the tool's caveats say so. That is not a bug in either side; it is the
 difference between an event's timestamp and the time its projection was
 written, and a production as-of comparison has to pick one axis and
 snapshot both sides on it.
+
+## Quality KPIs
+
+The controls above are zero-tolerance: a build is green or it is not. That
+answers "is the ledger right now?" and nothing else. The quality layer keeps
+the history, so the same tests also answer "how has it been going?", which
+is the literal job of *suivre et améliorer les indicateurs de performance et
+les processus de gestion de la qualité*.
+
+Nothing new runs. Two hooks in `dbt/macros/quality.sql` make every dbt
+invocation record itself, on every target:
+
+- `on-run-start` creates `quality.dbt_test_results`, `quality.model_row_counts`
+  and `quality.source_freshness` if they are missing;
+- `on-run-end` appends this invocation's rows: one per test result (status,
+  rows returned, duration, which model it tested, whether it is one of the
+  controls), one per model built with its `count(*)`, and for the two streams
+  everything hangs off, `cala_entry_events` and the outbox, the newest
+  `recorded_at`, the highest outbox sequence, and the lag from that to the
+  run's start.
+
+Three marts, tagged `quality`, turn the rows into KPIs tracked over time:
+
+| mart | grain | KPI |
+|---|---|---|
+| `fct_test_results` | (invocation, test) | pass rate history per test; `is_control` separates the five accounting controls from the schema tests |
+| `fct_row_count_drift` | (invocation, model) | row count against the previous build of the same model; `is_outlier` past `var('row_count_drift_threshold_pct')` (20 by default) |
+| `rpt_quality_kpis` | invocation | one row per run: `pass_rate`, `all_controls_passed`, `outbox_freshness_lag_s`, `entries_freshness_lag_s`, `max_abs_drift_pct`, `outlier_models` |
+
+The hooks record after the run, so a run's own numbers reach the marts on
+the next materialisation: `make quality` (`dbt run --select tag:quality`)
+refreshes just those three marts without re-running the tests. The marts
+report; they never gate. A failed control still fails the build on its own,
+and now also leaves a `fail` row with the test's message behind it.
+
+`quality_kpis(last_n)` on the MCP server returns the last runs, the tests
+that failed in the latest recorded run and its drift outliers, so "what
+broke last night, and was it the data or the build?" is one call. Two
+things to know when reading the numbers: the entries stream's freshness lag
+is inflated by backdated entries (`recorded_at` is caller-supplied, see
+"Extraction"), so the outbox lag is the ingestion-lag signal; and the seeds
+never change, so on the CI path drift is 0 and freshness grows by one day a
+day, which is exactly what a static fixture should show.
 
 ## Portability
 

@@ -32,6 +32,8 @@ balances cala itself persisted.
 - `make build FULL_REFRESH=1` — rebuild incremental models. Required after `make fixtures`
   (the seeds are replaced, and `stg_cala_entries` would otherwise keep the old batch).
 - `make docs` — generate the dbt docs site
+- `make quality` — `dbt run --select tag:quality`: refresh the KPI marts from what the hooks recorded
+  (a run's own results reach the marts on the next materialisation; no tests re-run)
 - `TARGET=bigquery make build` — same package against BigQuery (needs credentials, see `dbt/profiles.yml`)
 - Single model: `cd dbt && uv run dbt build --select fct_entries+`
 - Single test: `cd dbt && uv run dbt test --select assert_balances_reconcile`
@@ -91,11 +93,15 @@ dbt/models/marts/          dims, facts, and the trial balance report
         │
 dbt/tests/                 singular tests = the accounting controls
         │
+dbt/macros/quality.sql     on-run-start / on-run-end hooks: every invocation appends
+quality.*                  its test results, model row counts and source freshness
+stg_quality_* / marts      -> fct_test_results, fct_row_count_drift, rpt_quality_kpis
+        │                     (tag:quality; `make quality` refreshes them)
 mcp/cala_mcp/              MCP server over dbt/target/manifest.json + the DuckDB file
   manifest.py              Manifest / Relation: models, columns, grain, lineage; require() gate
   db.py                    read-only DuckDB connection; Decimal -> exact string
   tools.py                 describe_model, list_models, trial_balance,
-                           explain_account_balance, reconcile as plain functions
+                           explain_account_balance, reconcile, quality_kpis as plain functions
   server.py                MCPServer registration, ToolError mapping, stdio entrypoint
 mcp/tests/                 pytest over the built warehouse (no fixtures of its own)
 
@@ -182,6 +188,25 @@ extract/tests/             pytest against that Postgres; needs CALA_PG_URL
 - `stg_cala_entries` re-selects erased entry ids on every incremental run;
   the other staging models are views and need nothing. A mart that carries a
   personal field must be listed in the control's `holders`.
+### Quality layer rules (dbt/macros/quality.sql, stg_quality_*, tag:quality)
+- The hooks record, they never gate. `quality_record_results` must not raise
+  on a failed test or an odd result; the build's exit code already carries
+  that. Keep inserts to one batched statement per table so BigQuery pays one
+  small job each. Both hooks end with `adapter.commit()`: a hook whose
+  rendered SQL is empty never commits the transaction `statement()` opened.
+- Recorded rows are facts about a past run. An invocation's own results
+  reach the marts on the next materialisation (`make quality`), never in the
+  same run; do not try to close that loop.
+- Quality-tagged models are not row-counted (they grow by construction and
+  would flag their own drift). Tag any new quality model `quality`.
+- `is_outlier` and `all_controls_passed` are KPIs, not tests. A dbt test on
+  the quality marts checks shape (grain, ranges), never "the last build was
+  green"; that would make one red build fail the next one too.
+- Context attributes the hooks rely on (dbt-core 1.12): `results[].node`,
+  `.status`, `.failures`, `.execution_time`, `.message`; on generic test
+  nodes `attached_node` and `test_metadata.name`; on every node
+  `depends_on.nodes`, `tags`, `config.materialized`, `relation_name`;
+  `invocation_id` and `run_started_at` from the context.
 
 ### MCP server rules (mcp/)
 - Every identifier in a query comes from the manifest: `manifest.model(name)`
@@ -258,4 +283,4 @@ explicitly says it is producing an "available" balance.
 
 ### Commits
 - Conventional commits: `feat(scope):`, `fix(scope):`, `test:`, `docs:`, `chore:`.
-- Scope is the layer: `fixtures`, `staging`, `marts`, `tests`, `ci`, `mcp`, `extract`, `erasure`.
+- Scope is the layer: `fixtures`, `staging`, `marts`, `tests`, `ci`, `mcp`, `extract`, `erasure`, `quality`.
