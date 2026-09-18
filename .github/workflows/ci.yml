@@ -32,6 +32,24 @@ jobs:
       - name: Incremental re-run is a no-op on unchanged seeds
         run: cd dbt && uv run dbt run --select stg_cala_entries
 
+      # The quality hooks recorded the build above and the run just now; a
+      # second test run gives the KPI marts two tested invocations to compare.
+      - name: dbt test again, then refresh the quality KPI marts
+        run: make test && make quality
+
+      - name: The KPI marts hold the recorded runs, every control passed
+        run: |
+          uv run python -c "
+          import duckdb
+          c = duckdb.connect('dbt/cala_warehouse.duckdb', read_only=True)
+          tested = c.execute('select count(distinct invocation_id) from quality.dbt_test_results').fetchone()[0]
+          assert tested >= 2, tested
+          rows = c.execute('select pass_rate, all_controls_passed, outbox_max_sequence from marts.rpt_quality_kpis where tests_run > 0').fetchall()
+          assert rows and all(r[0] == 1 and r[1] for r in rows), rows
+          assert all(r[2] == 5207 for r in rows), rows
+          print(f'{tested} tested invocations recorded, {len(rows)} KPI rows, pass rate 1.0')
+          "
+
       - name: Upload dbt artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -55,6 +73,11 @@ jobs:
       # writes; there is no other fixture.
       - name: dbt seed, then build
         run: make build
+
+      # The quality KPI test needs a recorded invocation in the marts, which
+      # the hooks only provide on the run after the one they recorded.
+      - name: dbt test again, then refresh the quality KPI marts
+        run: make test && make quality
 
       - name: pytest (MCP tools, in-process server)
         run: make mcp-test
