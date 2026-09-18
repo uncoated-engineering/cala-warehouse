@@ -6,27 +6,34 @@ requires-python = ">=3.12"
 dependencies = [
     "dbt-core>=1.9",
     "dbt-duckdb>=1.9",
+    "dlt>=1.30.0",
     "duckdb>=1.1",
     "mcp>=2",
+    "psycopg[binary]>=3.3.5",
 ]
 
 [dependency-groups]
-bigquery = ["dbt-bigquery>=1.9"]
+bigquery = [
+    "dbt-bigquery>=1.9",
+    "dlt[bigquery]>=1.30.0",
+]
 dev = [
     "pytest>=8",
 ]
 
 [project.scripts]
 cala-mcp = "cala_mcp.server:main"
+cala-extract = "cala_extract.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# The dbt package is not Python; the only Python package is the MCP server
-# under mcp/. Installed editable by `uv sync`, so `uv run cala-mcp` works.
+# The dbt package is not Python; the Python packages are the MCP server under
+# mcp/ and the extractor under extract/. Installed editable by `uv sync`, so
+# `uv run cala-mcp` and `uv run cala-extract` work.
 [tool.hatch.build.targets.wheel]
-packages = ["mcp/cala_mcp"]
+packages = ["mcp/cala_mcp", "extract/cala_extract"]
 
 [tool.pytest.ini_options]
-testpaths = ["mcp/tests"]
+testpaths = ["mcp/tests", "extract/tests"]

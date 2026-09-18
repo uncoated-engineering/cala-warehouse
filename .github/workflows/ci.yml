@@ -3,6 +3,9 @@ name: dbt build (DuckDB)
 # The whole package builds and tests from committed seeds. No credentials, no
 # services, no network beyond installing Python packages. The mcp-tests job
 # rebuilds the same warehouse and runs the MCP server's pytest suite over it.
+# The extract job is the only one with a service: a Postgres that plays cala
+# (its real DDL + the seeds), so the extractor is exercised end to end and the
+# dbt package is built from what it landed rather than from seeds.
 on:
   push:
     branches: [main]
@@ -58,3 +61,54 @@ jobs:
 
       - name: The stdio server starts and exits on EOF
         run: timeout 20 uv run cala-mcp < /dev/null
+
+  extract:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: pg
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U user -d pg"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      CALA_PG_URL: postgres://user:password@127.0.0.1:5432/pg
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --frozen
+
+      # Round trip, incremental load, in-flight and abandoned outbox
+      # sequences, wiped warehouse. Each test rebuilds the source database.
+      - name: pytest (extractor against Postgres)
+        run: make extract-test
+
+      # Then the real flow: seeds -> Postgres -> extractor -> DuckDB -> dbt
+      # -> MCP, with no dbt seeds involved.
+      - name: Load cala's schema and the seeds into Postgres
+        run: uv run python -m cala_extract.fixture_db "$CALA_PG_URL"
+
+      - name: Extract (first load, verified against the snapshot)
+        run: make extract
+
+      - name: Extract again (streams load nothing, state tables replaced)
+        run: |
+          uv run cala-extract --verify --json > extract.json
+          python3 -c "import json; s=json.load(open('extract.json')); assert s['rows_loaded']['cala_entry_events'] == 0 and s['watermark_before'] == s['watermark_after'], s"
+
+      - name: dbt build on the extracted tables (no seeds)
+        run: make build-extracted
+
+      - name: pytest (MCP tools over the extracted warehouse)
+        run: make mcp-test
